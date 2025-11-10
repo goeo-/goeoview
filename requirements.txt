@@ -1,0 +1,9 @@
+httpx==0.27.0
+httpx-ws==0.6.0
+cbrrr==1.0.0
+cryptography==42.0.8
+multiformats==0.3.1.post4
+orjson==3.10.6
+leb128==1.0.8
+async-lru==2.0.4
+clickhouse-connect==0.7.16

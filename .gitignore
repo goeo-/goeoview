@@ -1,0 +1,5 @@
+.venv/*
+.vscode/*
+__pycache__
+unverified/*
+.DS_Store
