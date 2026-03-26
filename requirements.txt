@@ -7,3 +7,4 @@ orjson==3.10.6
 leb128==1.0.8
 async-lru==2.0.4
 clickhouse-connect==0.7.16
+watchfiles==1.1.1

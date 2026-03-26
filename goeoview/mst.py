@@ -8,6 +8,7 @@ def count_zeroes(bytes):
             if (byte >> bit & 1) != 0:
                 return zero_count
             zero_count += 1
+    return zero_count
 
 
 def mst_dfs(tree, visited, start, target_k, target_v, levels=0):
@@ -22,7 +23,7 @@ def mst_dfs(tree, visited, start, target_k, target_v, levels=0):
         return False, None, None, None, levels
 
     if start in visited:
-        raise Exception("invalid tree")
+        raise Exception(f"MST cycle detected: node={start}")
 
     visited.add(start)
 
@@ -47,14 +48,14 @@ def mst_dfs(tree, visited, start, target_k, target_v, levels=0):
             first_key = key
 
         if last_key is not None and last_key >= key:
-            raise Exception("entries are out of order")
+            raise Exception(f"MST key not greater than previous: key={key} last_key={last_key} node={start}")
 
         right_state = mst_dfs(tree, visited, entry["t"], target_k, target_v, levels + 1)
 
         max_levels = max(max_levels, right_state[4])
 
         if right_state[1] is not None and right_state[1] <= key:
-            raise Exception("entries are out of order")
+            raise Exception(f"MST right subtree first key not greater than parent: right_first={right_state[1]} key={key} node={start}")
 
         found = found or right_state[0]
 
@@ -62,13 +63,13 @@ def mst_dfs(tree, visited, start, target_k, target_v, levels=0):
         if depth is None:
             depth = this_depth
         if depth != this_depth:
-            raise Exception("mst node has entries with different depths")
+            raise Exception(f"MST node has entries with different depths: depth={this_depth} expected={depth} key={key} node={start}")
 
         if left_state[3] is not None and left_state[3] >= this_depth:
-            raise Exception("entries are out of order")
+            raise Exception(f"MST left subtree depth >= entry depth: left={left_state[3]} entry={this_depth} key={key} node={start}")
 
         if right_state[3] is not None and right_state[3] >= this_depth:
-            raise Exception("entries are out of order")
+            raise Exception(f"MST right subtree depth >= entry depth: right={right_state[3]} entry={this_depth} key={key} node={start}")
 
         if (
             target_v is not None
@@ -83,7 +84,7 @@ def mst_dfs(tree, visited, start, target_k, target_v, levels=0):
         last_key = None
 
     if first_key is not None and last_key is not None and last_key < first_key:
-        raise Exception("entries are out of order", last_key, first_key)
+        raise Exception(f"MST last key less than first key: last_key={last_key} first_key={first_key} node={start}")
 
     first_key = left_state[1] or first_key
 
@@ -94,7 +95,7 @@ def mst_dfs_dump(tree, visited, start, levels=0):
         return [], None, levels
 
     if start in visited:
-        raise Exception("invalid tree")
+        raise Exception(f"MST cycle detected: node={start}")
 
     visited.add(start)
 
@@ -117,8 +118,8 @@ def mst_dfs_dump(tree, visited, start, levels=0):
             first_key = key
 
         if last_key is not None and last_key >= key:
-            raise Exception("entries are out of order")
-        
+            raise Exception(f"MST key not greater than previous: key={key} last_key={last_key} node={start}")
+
         values.append((key, entry["v"]))
 
         right_values, right_depth, right_max_levels = mst_dfs_dump(tree, visited, entry["t"], levels + 1)
@@ -126,22 +127,22 @@ def mst_dfs_dump(tree, visited, start, levels=0):
         values.extend(right_values)
 
         max_levels = max(max_levels, right_max_levels)
-        
+
         right_first_key = right_values[0][0] if len(right_values) > 0 else None
         if right_first_key is not None and right_first_key <= key:
-            raise Exception("entries are out of order")
+            raise Exception(f"MST right subtree first key not greater than parent: right_first={right_first_key} key={key} node={start}")
 
         this_depth = count_zeroes(hashlib.sha256(key).digest()) // 2
         if depth is None:
             depth = this_depth
         if depth != this_depth:
-            raise Exception("mst node has entries with different depths")
+            raise Exception(f"MST node has entries with different depths: depth={this_depth} expected={depth} key={key} node={start}")
 
         if (
-            left_depth is not None and left_depth >= this_depth
-            or right_depth is not None and right_depth >= this_depth
+            (left_depth is not None and left_depth >= this_depth)
+            or (right_depth is not None and right_depth >= this_depth)
         ):
-            raise Exception("entries are out of order")
+            raise Exception(f"MST subtree depth >= entry depth: left={left_depth} right={right_depth} entry={this_depth} key={key} node={start}")
 
         last_key = right_values[-1][0] if len(right_values) > 0 else key
 
@@ -149,6 +150,6 @@ def mst_dfs_dump(tree, visited, start, levels=0):
         last_key = None
 
     if first_key is not None and last_key is not None and last_key < first_key:
-        raise Exception("entries are out of order", last_key, first_key)
+        raise Exception(f"MST last key less than first key: last_key={last_key} first_key={first_key} node={start}")
 
     return values, depth, max_levels

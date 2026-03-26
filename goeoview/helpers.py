@@ -17,20 +17,18 @@ class Key:
         self.key = key
         self.key_n = key_n
 
-    def verify(self, signature, data, check_n=False, prehashed=False):
-        if len(signature) == 64:
-            r = int.from_bytes(signature[:32], "big")
-            s = int.from_bytes(signature[32:], "big")
-
-            signature = encode_dss_signature(r, s)
-
+    def verify(self, signature, data, prehashed=False):
+        if len(signature) != 64:
+            raise InvalidSignature("signature must be 64-byte raw (r||s) format")
+        r = int.from_bytes(signature[:32], "big")
+        s = int.from_bytes(signature[32:], "big")
+        if s > self.key_n // 2:
+            raise InvalidSignature("high-S signature")
         self.key.verify(
-            signature,
+            encode_dss_signature(r, s),
             data,
             ec.ECDSA(Prehashed(hashes.SHA256()) if prehashed else hashes.SHA256()),
         )
-        if check_n and s > self.key_n // 2:
-            raise InvalidSignature("s is too high")
 
 
 normal = b"abcdefghijklmnopqrstuvwxyz234567"
@@ -71,23 +69,25 @@ def parse_pubkey(key):
     if key is None:
         return None
 
-    key = multibase.decode(key)
-    key_type, key = multicodec.unwrap(key)
+    key_bytes = multibase.decode(key)
+    key_type, key_data = multicodec.unwrap(key_bytes)
 
     if key_type.name == "secp256k1-pub":
         key_n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-        key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), key)
+        pub_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256K1(), key_data)
     elif key_type.name == "p256-pub":
         key_n = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
-        key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), key)
+        pub_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), key_data)
     else:
-        raise Exception("invalid pubkey", key_type, key)
+        raise Exception("invalid pubkey", key_type, key_data)
 
-    return Key(key, key_n)
+    return Key(pub_key, key_n)
 
 
 def parse_cid(cid):
-    assert cid.startswith("b")
+    if not cid.startswith("b"):
+        raise ValueError("CID must be base32 multibase")
     cid_h = b32d(cid[1:])
-    assert cid_h.startswith(b"\x01q\x12 ")
+    if not cid_h.startswith(b"\x01q\x12 "):
+        raise ValueError("unsupported CID codec")
     return cid_h[4:]

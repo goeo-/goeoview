@@ -1,81 +1,80 @@
 from async_lru import alru_cache
-import httpx
 import orjson
 
 import asyncio
 from datetime import datetime, UTC
 
 from .db import DB
-
-
-client = httpx.AsyncClient()
+from .safe_transport import safe_get
 
 # todo make sure did_id mv is before follow/block mvs
 # todo also add first level mv to did_id from follow/block targets
 # todo potentially also like targets, post replied tos, etc
 
-@alru_cache(maxsize=10240, ttl=60 * 5)
-async def resolve(did, weak=False, retries=0):
-    db = DB()
-    if did.startswith("did:plc:"):
-        ret = await db.db.query(
-            "SELECT handle, pds, labeler, chat, feedgen, atproto_key, labeler_key FROM plc_latest WHERE did = {did:String} ORDER BY created_at DESC LIMIT 1",
-            {"did": did},
-        )
 
-        try:
-            ret = ret.first_row
-        except IndexError:
+class DIDResolver:
+    def __init__(self, http_clients, plc_state_store):
+        self._http_clients = http_clients
+        self._plc_state_store = plc_state_store
+        self.resolve = alru_cache(maxsize=10240, ttl=60 * 5)(self._resolve)
+
+    async def _resolve(self, did, weak=False, retries=0):
+        db = DB()
+        if did.startswith("did:plc:"):
+            cached = await self._plc_state_store.get_latest(did)
+            if cached is not None:
+                return AtprotoUser(
+                    did=cached["did"],
+                    pds=cached["pds"],
+                    handle=cached["handle"],
+                    labeler=cached["labeler"],
+                    chat=cached["chat"],
+                    feedgen=cached["feedgen"],
+                    atproto_key=cached["atproto_key"][8:] if cached["atproto_key"] else None,
+                    labeler_key=cached["labeler_key"][8:] if cached["labeler_key"] else None,
+                )
+
             if not weak:
                 await asyncio.sleep(1)
                 if retries < 5:
-                    return await resolve(did, retries=retries + 1)
-                else:
-                    raise Exception("plc not found", did)
+                    return await self.resolve(did, retries=retries + 1)
+                weak = True
 
-            ret = await client.get(f"https://plc.directory/{did}")
+            ret = await self._http_clients.did().get(f"https://plc.directory/{did}")
             if ret.status_code != 200:
                 raise Exception("plc not found", did)
 
             return parse_did_doc(ret.json())
 
-        return AtprotoUser(
-            did=did,
-            pds=ret[1],
-            handle=ret[0],
-            labeler=ret[2],
-            chat=ret[3],
-            feedgen=ret[4],
-            atproto_key=ret[5][8:] if ret[5] else None,
-            labeler_key=ret[6][8:] if ret[6] else None,
-        )
+        if did.startswith("did:web:"):
+            ret = await safe_get(
+                self._http_clients.did(),
+                f"https://{did[8:]}/.well-known/did.json",
+            )
+            if ret.status_code != 200:
+                raise Exception("web not found", did)
 
-    elif did.startswith("did:web:"):
-        ret = await client.get(f"https://{did[8:]}/.well-known/did.json")
-        if ret.status_code != 200:
-            raise Exception("web not found", did)
-        
-        did_doc = ret.text
+            did_doc = ret.text
 
-        ret = await db.db.query('select doc from did_web where did={did:String} order by fetched_at desc limit 1', {"did": did})
-        try:
-            old_doc = ret.first_row[0]
-        except IndexError:
-            old_doc = ''
+            ret = await db.db.query('select doc from did_web where did={did:String} order by fetched_at desc limit 1', {"did": did})
+            try:
+                old_doc = ret.first_row[0]
+            except IndexError:
+                old_doc = ''
 
-        if old_doc != did_doc:
-            await db.db.insert('did_web', [(
-                did,
-                datetime.now(UTC),
-                did_doc,
-            )], settings={'async_insert': True})
+            if old_doc != did_doc:
+                await db.db.insert('did_web', [(
+                    did,
+                    datetime.now(UTC),
+                    did_doc,
+                )], settings={'async_insert': True})
 
-        ret = parse_did_doc(orjson.loads(did_doc))
-        # todo insert?
-        assert ret.did == did
-        return ret
+            ret = parse_did_doc(orjson.loads(did_doc))
+            # todo insert?
+            if ret.did != did:
+                raise Exception("did:web document ID mismatch", did, ret.did)
+            return ret
 
-    else:
         raise Exception("invalid did", did)
 
 
