@@ -16,6 +16,34 @@ def test_parse_firehose_message_type_rejects_unknown_prefix():
         parse_firehose_message_type(b"not-a-firehose-packet")
 
 
+def test_parse_firehose_message_type_recognizes_sync():
+    header = cbrrr.encode_dag_cbor({"t": "#sync", "op": 1})
+    body = cbrrr.encode_dag_cbor({"did": "did:plc:test", "rev": "abc"})
+    msg_type, remainder = parse_firehose_message_type(header + body)
+    assert msg_type == "sync"
+    assert remainder == body
+
+
+def test_decode_sync_header_extracts_fields():
+    from goeoview.relay import _decode_sync_header
+
+    message = cbrrr.encode_dag_cbor(
+        {
+            "did": "did:plc:test",
+            "rev": "3mhpo2yjlqz2z",
+            "seq": 99,
+            "time": "2026-03-23T08:41:57.187Z",
+            "blocks": b"\x00",
+        }
+    )
+
+    header = _decode_sync_header(message)
+    assert header["seq"] == 99
+    assert header["did"] == "did:plc:test"
+    assert header["rev"] == "3mhpo2yjlqz2z"
+    assert header["time"] == "2026-03-23T08:41:57.187Z"
+
+
 def test_parse_cid_rejects_invalid_multibase():
     with pytest.raises(ValueError):
         parse_cid("not-a-cid")

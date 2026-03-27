@@ -8,6 +8,7 @@ from httpx_ws._exceptions import WebSocketNetworkError
 from datetime import datetime, UTC, timedelta
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
+from urllib.parse import urlparse
 import asyncio
 import json
 
@@ -21,6 +22,16 @@ from .firehose_worker import validate_commit
 logger = get_logger("goeoview.relay")
 
 INTENDED_SKEW = timedelta(seconds=0)
+
+
+def _is_pds_blocked(pds_url, blocked_pds):
+    host = urlparse(pds_url).hostname
+    if host is None:
+        return False
+    return any(
+        host == pattern or host.endswith(pattern)
+        for pattern in blocked_pds
+    )
 
 
 class FirehoseProtocolError(Exception):
@@ -62,12 +73,14 @@ async def insert_commits(db: DB, memory: deque, firehose_url, last_seq):
     while memory:
         did, collection, key, rev, value, since, action = memory.popleft()
 
-        if did not in revs:
-            # we have no commits for this repo
-            gaps.append((did, 0, since))
-        elif since is None:
+        if since is None:
             # why did this repo reset? do we care?
             logger.warning("repo reset with null since: %s %s/%s", did, collection, key)
+            if did not in revs:
+                gaps.append((did, 0, 0))
+        elif did not in revs:
+            # we have no commits for this repo
+            gaps.append((did, 0, since))
         elif revs[did] < since:
             # since is newer than our last commit, we have a gap
             gaps.append((did, revs[did], since))
@@ -230,7 +243,7 @@ async def _process_batch(batch, memory, did_resolver, config, loop, pool, _valid
             logger.warning("DID resolve failed for %s: %s", repo, user)
             action.append("resolve_failed")
             continue
-        if user.pds is not None and user.pds.startswith("https://atproto.brid.gy"):
+        if user.pds is not None and _is_pds_blocked(user.pds, config.blocked_pds):
             action.append("skip")
             continue
         action.append("worker")
@@ -324,7 +337,10 @@ async def firehose(firehose_url, did_resolver, config, quarantine, pool, registr
 
                 if message_type == "sync":
                     sync_header = _decode_sync_header(message)
-                    if sync_header["seq"] <= last_seen_seq:
+                    if sync_header["seq"] == last_seen_seq:
+                        logger.warning("duplicate seq %s (sync), skipping", sync_header["seq"])
+                        continue
+                    if sync_header["seq"] < last_seen_seq:
                         raise CommitValidationError(
                             f"non-monotonic seq {sync_header['seq']} after {last_seen_seq}"
                         )
@@ -341,13 +357,23 @@ async def firehose(firehose_url, did_resolver, config, quarantine, pool, registr
                 if header is None:
                     continue
 
-                if header["seq"] <= last_seen_seq:
+                if header["seq"] == last_seen_seq:
+                    logger.warning("duplicate seq %s (commit), skipping", header["seq"])
+                    continue
+                if header["seq"] < last_seen_seq:
                     raise CommitValidationError(
                         f"non-monotonic seq {header['seq']} after {last_seen_seq}"
                     )
                 last_seen_seq = header["seq"]
 
                 sendtime = datetime.fromisoformat(header["time"])
+                if sendtime.tzinfo is None:
+                    await quarantine.save(
+                        header["repo"], header["seq"], message,
+                        f"invalid datetime: missing timezone in {header['time']!r}",
+                        "firehose",
+                    )
+                    continue
                 delta = recvtime - sendtime
                 sleep_time = (INTENDED_SKEW - delta).total_seconds()
                 if sleep_time > 0:

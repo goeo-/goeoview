@@ -91,6 +91,51 @@ async def test_firehose_flushes_memory_before_reconnect(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_process_batch_skips_blocked_pds(tmp_path):
+    """Commits from PDS hosts matching blocked_pds patterns are silently skipped."""
+    from collections import deque
+    from goeoview.relay import _process_batch
+
+    batch = [
+        (b"bridgy-bytes", 10, "did:plc:bridgy", None),
+        (b"bridgy-slash-bytes", 11, "did:plc:bridgy2", None),
+        (b"stream-bytes", 12, "did:plc:stream", None),
+        (b"normal-bytes", 13, "did:plc:normal", None),
+    ]
+
+    mock_resolver = MagicMock()
+
+    def make_user(pds):
+        user = MagicMock()
+        user.pds = pds
+        user.atproto_key = "zFakeKey"
+        return user
+
+    users = {
+        "did:plc:bridgy": make_user("https://atproto.brid.gy"),
+        "did:plc:bridgy2": make_user("https://atproto.brid.gy/"),
+        "did:plc:stream": make_user("https://prod-ams0.stream.place"),
+        "did:plc:normal": make_user("https://pds.example.com"),
+    }
+    mock_resolver.resolve = AsyncMock(side_effect=lambda did: users[did])
+
+    mock_config = MagicMock()
+    mock_config.blocked_pds = ["atproto.brid.gy", ".stream.place"]
+
+    def fake_validate(msg, key):
+        return {"ok": True, "rows": [("did", "col", "rk", 1, b"{}", None, "create")]}
+
+    from goeoview.quarantine import QuarantineStore
+    quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
+
+    memory = deque()
+    await _process_batch(batch, memory, mock_resolver, mock_config, None, None, fake_validate, quarantine)
+
+    # Only the normal commit should produce rows
+    assert len(memory) == 1
+
+
+@pytest.mark.asyncio
 async def test_failed_commit_quarantined(tmp_path):
     """Non-fatal worker errors must quarantine the raw message, not silently drop it."""
     from collections import deque
@@ -288,6 +333,79 @@ async def test_handle_commit_serial_falls_through_to_retries_when_plc_not_ahead(
     assert call_count == 3
 
 
+class _TwoMessageWS:
+    """Sends two commit messages then disconnects."""
+
+    def __init__(self, headers):
+        self._headers = list(headers)
+        self._index = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def receive_bytes(self):
+        if self._index < len(self._headers):
+            self._index += 1
+            return b"payload"
+        raise WebSocketNetworkError("disconnect")
+
+
+@pytest.mark.asyncio
+async def test_naive_timestamp_quarantined(tmp_path):
+    """A commit whose time field lacks timezone info must be quarantined, not crash."""
+    from goeoview.relay import firehose
+
+    mock_db = MagicMock()
+    mock_db.db.query = AsyncMock(return_value=MagicMock(row_count=0))
+
+    mock_config = MagicMock()
+    mock_config.firehose_workers = 1
+    mock_config.firehose_batch_size = 100
+    mock_config.firehose_insert_every = 9999
+    mock_config.firehose_print_clock_skew_every = 100
+    mock_config.firehose_batch_timeout = None
+
+    # This is the actual offending timestamp from atom.new.incorso.xyz
+    naive_header = {"seq": 5, "repo": "did:plc:47awjkxlto45stih3zqt2jt2", "time": "2026-03-25T18:09:25.6053381"}
+    good_header = {"seq": 6, "repo": "did:plc:good", "time": "2026-03-25T18:09:26.000Z"}
+
+    headers = [naive_header, good_header]
+    header_index = [0]
+
+    def fake_decode_header(msg):
+        i = header_index[0]
+        header_index[0] += 1
+        return headers[i]
+
+    async def fake_process_batch(batch, memory, *args, **kwargs):
+        pass
+
+    insert_mock = AsyncMock()
+
+    with patch("goeoview.relay.DB", return_value=mock_db):
+        with patch("goeoview.relay.aconnect_ws", return_value=_TwoMessageWS(headers)):
+            with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
+                with patch("goeoview.relay._decode_commit_header", side_effect=fake_decode_header):
+                    with patch("goeoview.relay._process_batch", side_effect=fake_process_batch):
+                        with patch("goeoview.relay.insert_commits", insert_mock):
+                            from goeoview.quarantine import QuarantineStore
+                            quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
+                            mock_registry = MagicMock()
+                            with pytest.raises(WebSocketNetworkError):
+                                await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
+
+    # The naive-timestamp commit should be quarantined
+    assert quarantine.count() == 1
+    recent = quarantine.recent()
+    assert recent[0]["repo"] == "did:plc:47awjkxlto45stih3zqt2jt2"
+    assert recent[0]["seq"] == 5
+    assert recent[0]["stage"] == "firehose"
+    assert "datetime" in recent[0]["reason"].lower() or "timezone" in recent[0]["reason"].lower()
+
+
 class _SyncThenDisconnectWS:
     """Sends a #sync message followed by a disconnect."""
 
@@ -358,3 +476,216 @@ async def test_sync_message_inserts_gap(tmp_path):
     gap_rows = gap_calls[0].args[1]
     assert len(gap_rows) == 1
     assert gap_rows[0] == (sync_did, 0, expected_rev_int)
+
+
+class _MultiMessageWS:
+    """Sends N messages then disconnects."""
+
+    def __init__(self, count):
+        self._count = count
+        self._index = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def receive_bytes(self):
+        if self._index < self._count:
+            self._index += 1
+            return b"payload"
+        raise WebSocketNetworkError("disconnect")
+
+
+@pytest.mark.asyncio
+async def test_duplicate_commit_seq_warns_and_skips(tmp_path):
+    """A commit with the same seq as the previous one should warn and skip, not raise."""
+    from goeoview.relay import firehose
+
+    mock_db = MagicMock()
+    mock_db.db.query = AsyncMock(return_value=MagicMock(row_count=0))
+
+    mock_config = MagicMock()
+    mock_config.firehose_workers = 1
+    mock_config.firehose_batch_size = 100
+    mock_config.firehose_insert_every = 9999
+    mock_config.firehose_print_clock_skew_every = 100
+    mock_config.firehose_batch_timeout = None
+
+    # Two commits with the same seq
+    dupe_header = {"seq": 100, "repo": "did:plc:dupe", "time": "2025-01-01T00:00:00+00:00"}
+
+    async def fake_process_batch(batch, memory, *args, **kwargs):
+        memory.extend([("did:plc:dupe", "app.bsky.feed.post", "rk", 1, b"{}", None, "create")] * len(batch))
+
+    insert_mock = AsyncMock()
+
+    with patch("goeoview.relay.DB", return_value=mock_db):
+        with patch("goeoview.relay.aconnect_ws", return_value=_MultiMessageWS(2)):
+            with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
+                with patch("goeoview.relay._decode_commit_header", return_value=dupe_header):
+                    with patch("goeoview.relay._process_batch", side_effect=fake_process_batch):
+                        with patch("goeoview.relay.insert_commits", insert_mock):
+                            from goeoview.quarantine import QuarantineStore
+                            quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
+                            mock_registry = MagicMock()
+                            # Should NOT raise — duplicate seq should be skipped
+                            with pytest.raises(WebSocketNetworkError):
+                                await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
+
+    # Only 1 commit should have been processed (the duplicate skipped)
+    if insert_mock.await_args_list:
+        total_rows = sum(len(c.args[1]) for c in insert_mock.await_args_list)
+        assert total_rows == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_sync_seq_warns_and_skips(tmp_path):
+    """A #sync with the same seq as the previous one should warn and skip, not raise."""
+    from goeoview.relay import firehose
+
+    sync_did = "did:plc:dupesync"
+    sync_rev = "3mhpo2yjlqz2z"
+    sync_seq = 500
+
+    # Build the raw sync message
+    sync_msg = (
+        cbrrr.encode_dag_cbor({"t": "#sync", "op": 1})
+        + cbrrr.encode_dag_cbor({
+            "did": sync_did,
+            "rev": sync_rev,
+            "seq": sync_seq,
+            "time": "2026-03-23T08:00:00.000Z",
+            "blocks": b"\x00",
+        })
+    )
+
+    class _DupeSyncWS:
+        """Sends the same sync message twice then disconnects."""
+        def __init__(self):
+            self._calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def receive_bytes(self):
+            self._calls += 1
+            if self._calls <= 2:
+                return sync_msg
+            raise WebSocketNetworkError("disconnect")
+
+    mock_db = MagicMock()
+    mock_db.db.query = AsyncMock(return_value=MagicMock(row_count=0))
+    mock_db.db.insert = AsyncMock()
+
+    mock_config = MagicMock()
+    mock_config.firehose_workers = 1
+    mock_config.firehose_batch_size = 100
+    mock_config.firehose_insert_every = 9999
+    mock_config.firehose_print_clock_skew_every = 100
+    mock_config.firehose_batch_timeout = None
+
+    with patch("goeoview.relay.DB", return_value=mock_db):
+        with patch("goeoview.relay.aconnect_ws", return_value=_DupeSyncWS()):
+            from goeoview.quarantine import QuarantineStore
+            quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
+            mock_registry = MagicMock()
+            # Should NOT raise — duplicate sync seq should be skipped
+            with pytest.raises(WebSocketNetworkError):
+                await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
+
+    # Only 1 gap should have been inserted (the duplicate skipped)
+    gap_calls = [
+        call for call in mock_db.db.insert.await_args_list
+        if call.args[0] == "gap"
+    ]
+    assert len(gap_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_truly_non_monotonic_seq_still_raises(tmp_path):
+    """A commit with a seq LOWER than the previous one should still raise."""
+    from goeoview.relay import firehose, CommitValidationError
+
+    mock_db = MagicMock()
+    mock_db.db.query = AsyncMock(return_value=MagicMock(row_count=0))
+
+    mock_config = MagicMock()
+    mock_config.firehose_workers = 1
+    mock_config.firehose_batch_size = 100
+    mock_config.firehose_insert_every = 9999
+    mock_config.firehose_print_clock_skew_every = 100
+    mock_config.firehose_batch_timeout = None
+
+    headers = [
+        {"seq": 200, "repo": "did:plc:a", "time": "2025-01-01T00:00:00+00:00"},
+        {"seq": 100, "repo": "did:plc:b", "time": "2025-01-01T00:00:00+00:00"},
+    ]
+    header_index = [0]
+
+    def fake_decode(msg):
+        i = header_index[0]
+        header_index[0] += 1
+        return headers[i]
+
+    async def fake_process_batch(batch, memory, *args, **kwargs):
+        pass
+
+    with patch("goeoview.relay.DB", return_value=mock_db):
+        with patch("goeoview.relay.aconnect_ws", return_value=_MultiMessageWS(2)):
+            with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
+                with patch("goeoview.relay._decode_commit_header", side_effect=fake_decode):
+                    with patch("goeoview.relay._process_batch", side_effect=fake_process_batch):
+                        with patch("goeoview.relay.insert_commits", AsyncMock()):
+                            from goeoview.quarantine import QuarantineStore
+                            quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
+                            mock_registry = MagicMock()
+                            with pytest.raises(CommitValidationError, match="non-monotonic"):
+                                await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
+
+
+@pytest.mark.asyncio
+async def test_insert_commits_null_since_new_did():
+    """A commit with since=None for an unknown DID should insert a (did, 0, 0) gap."""
+    from collections import deque
+    from goeoview.relay import insert_commits
+
+    mock_db = MagicMock()
+    # No existing commits for this DID
+    mock_db.db.query = AsyncMock(return_value=MagicMock(result_rows=[]))
+    mock_db.db.insert = AsyncMock()
+
+    did = "did:plc:newdid"
+    memory = deque([(did, "app.bsky.feed.post", "rkey1", 100, b"val", None, "create")])
+
+    await insert_commits(mock_db, memory, "wss://example.com", 1)
+
+    gap_calls = [c for c in mock_db.db.insert.await_args_list if c.args[0] == "gap"]
+    assert len(gap_calls) == 1
+    gap_rows = gap_calls[0].args[1]
+    assert gap_rows == [(did, 0, 0)]
+
+
+@pytest.mark.asyncio
+async def test_insert_commits_null_since_known_did():
+    """A commit with since=None for a known DID should log a warning but not insert a gap."""
+    from collections import deque
+    from goeoview.relay import insert_commits
+
+    mock_db = MagicMock()
+    did = "did:plc:knowndid"
+    mock_db.db.query = AsyncMock(return_value=MagicMock(result_rows=[(did, 50)]))
+    mock_db.db.insert = AsyncMock()
+
+    memory = deque([(did, "app.bsky.feed.post", "rkey1", 100, b"val", None, "create")])
+
+    await insert_commits(mock_db, memory, "wss://example.com", 1)
+
+    gap_calls = [c for c in mock_db.db.insert.await_args_list if c.args[0] == "gap"]
+    assert len(gap_calls) == 1
+    gap_rows = gap_calls[0].args[1]
+    assert gap_rows == []

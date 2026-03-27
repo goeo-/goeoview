@@ -64,6 +64,9 @@ class Config:
         self.ws_connect_timeout = self._parse_float(
             "WS_CONNECT_TIMEOUT", "10.0", min_val=1.0
         )
+        self.blocked_pds = self._parse_list(
+            "BLOCKED_PDS", "atproto.brid.gy,.stream.place"
+        )
 
         Path(self.plc_state_db_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.quarantine_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +81,11 @@ class Config:
         if min_val is not None and value < min_val:
             raise ConfigError(f"{name} must be >= {min_val}, got {value}")
         return value
+
+    @staticmethod
+    def _parse_list(name: str, default: str) -> list[str]:
+        raw = os.getenv(name, default)
+        return [x.strip() for x in raw.split(",") if x.strip()]
 
     @staticmethod
     def _parse_float(name: str, default: str, min_val: float | None = None) -> float:
