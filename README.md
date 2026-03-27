@@ -59,5 +59,6 @@ Environment variables:
 - `GAP_PARSE_WORKERS` default CPU count
 - `GAP_MAX_TOTAL_WORKERS` default `128`
 - `WS_CONNECT_TIMEOUT` default `10.0`
+- `BLOCKED_PDS` default `atproto.brid.gy,.stream.place` — comma-separated list of PDS hostnames to skip (suffix matching with leading dot)
 - `PLC_STATE_DB_PATH` default `./data/plc_state.db`
 - `QUARANTINE_DB_PATH` default `./data/quarantine.db`

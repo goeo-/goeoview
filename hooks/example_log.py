@@ -13,9 +13,9 @@ async def on_post(commits, db):
         )
 
 
-def register(hook):
-    hook(
-        callback=on_post,
-        collections=["app.bsky.feed.post"],
-        ops=["create"],
-    )
+# def register(hook):
+#     hook(
+#         callback=on_post,
+#         collections=["app.bsky.feed.post"],
+#         ops=["create"],
+#     )
