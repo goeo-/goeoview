@@ -46,9 +46,6 @@ class Config:
         self.http_read_timeout = self._parse_float(
             "HTTP_READ_TIMEOUT", "30.0", min_val=0.1
         )
-        self.http_dns_validation_timeout = self._parse_float(
-            "HTTP_DNS_VALIDATION_TIMEOUT", "3.0", min_val=0.1
-        )
         self.max_repo_size = self._parse_int(
             "MAX_REPO_SIZE", "134217728", min_val=1024  # 128MB
         )

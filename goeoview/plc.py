@@ -8,10 +8,8 @@ from datetime import UTC, datetime, timedelta
 from multiprocessing import Pool
 
 import cbrrr
-import httpx
+import aiohttp
 import orjson
-from httpx_ws import aconnect_ws
-from httpx_ws._exceptions import WebSocketNetworkError
 
 from .db import DB
 from .helpers import InvalidSignature, b32e, parse_cid, parse_pubkey, ub64d
@@ -212,24 +210,27 @@ async def backfill_export(db, pool, cursor, config, http_clients, plc_state_stor
     while True:
         cycle_started = perf_counter()
         request_started = cycle_started
-        res = await http_clients.plc().get(
+        async with http_clients.trusted().get(
             "https://plc.directory/export",
             params={"count": config.plc_poller_count, "after": cursor},
-        )
+        ) as res:
+            if res.status == 429:
+                http_elapsed = perf_counter() - request_started
+                sleep_time = max(config.plc_export_target_interval - http_elapsed, 0.0)
+                logger.warning(
+                    "PLC export rate limited; sleeping %.3fs",
+                    sleep_time,
+                )
+                await asyncio.sleep(max(sleep_time, 0.0))
+                continue
+            if res.status != 200:
+                raise Exception(f"PLC export failed with {res.status}")
+            body = await res.read()
+
         http_elapsed = perf_counter() - request_started
         sleep_time = max(config.plc_export_target_interval - http_elapsed, 0.0)
 
-        if res.status_code == 429:
-            logger.warning(
-                "PLC export rate limited; sleeping %.3fs",
-                sleep_time,
-            )
-            await asyncio.sleep(max(sleep_time, 0.0))
-            continue
-        if res.status_code != 200:
-            raise Exception(f"PLC export failed with {res.status_code}")
-
-        records = [orjson.loads(x) for x in res.content.splitlines() if x.strip()]
+        records = [orjson.loads(x) for x in body.splitlines() if x.strip()]
         if not records:
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
@@ -282,9 +283,10 @@ STREAM_LOG_INTERVAL = 5.0
 
 
 async def stream_export(db, pool, cursor, config, plc_state_store):
-    ws_client = httpx.AsyncClient(timeout=httpx.Timeout(config.ws_connect_timeout))
+    timeout = aiohttp.ClientTimeout(connect=config.ws_connect_timeout)
+    session = aiohttp.ClientSession(timeout=timeout)
     try:
-        async with aconnect_ws(f"wss://plc.directory/export/stream?cursor={cursor}", client=ws_client) as ws:
+        async with session.ws_connect(f"wss://plc.directory/export/stream?cursor={cursor}") as ws:
             logger.info("PLC stream connected at cursor=%s", cursor)
             batch_records = 0
             batch_rows = 0
@@ -324,7 +326,13 @@ async def stream_export(db, pool, cursor, config, plc_state_store):
 
             try:
                 while True:
-                    message = await ws.receive_text()
+                    msg = await ws.receive()
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                    aiohttp.WSMsgType.CLOSED):
+                        raise aiohttp.ClientError("WebSocket closed")
+                    if msg.type == aiohttp.WSMsgType.ERROR:
+                        raise aiohttp.ClientError(f"WebSocket error: {ws.exception()}")
+                    message = msg.data
                     record = orjson.loads(message)
 
                     prev_started = perf_counter()
@@ -352,7 +360,7 @@ async def stream_export(db, pool, cursor, config, plc_state_store):
             finally:
                 flush_batch()
     finally:
-        await ws_client.aclose()
+        await session.close()
 
 
 async def poll(config, http_clients, plc_state_store):
@@ -410,7 +418,7 @@ async def poll(config, http_clients, plc_state_store):
                     )
                     seq_stream_attempts = 0
                     await asyncio.sleep(1)
-            except WebSocketNetworkError as exc:
+            except aiohttp.ClientError as exc:
                 logger.warning("PLC stream disconnected: %s", exc)
                 cursor = await plc_state_store.get_cursor()
                 seq_stream_attempts = 0

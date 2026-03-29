@@ -40,25 +40,24 @@ class DIDResolver:
                     return await self.resolve(did, retries=retries + 1)
                 weak = True
 
-            ret = await self._http_clients.did().get(f"https://plc.directory/{did}")
-            if ret.status_code != 200:
-                raise Exception("plc not found", did)
-
-            return parse_did_doc(ret.json())
+            async with self._http_clients.trusted().get(f"https://plc.directory/{did}") as ret:
+                if ret.status != 200:
+                    raise Exception("plc not found", did)
+                return parse_did_doc(await ret.json())
 
         if did.startswith("did:web:"):
             ret = await safe_get(
-                self._http_clients.did(),
+                self._http_clients.untrusted(),
                 f"https://{did[8:]}/.well-known/did.json",
             )
-            if ret.status_code != 200:
+            if ret.status != 200:
                 raise Exception("web not found", did)
 
             did_doc = ret.text
 
-            ret = await db.db.query('select doc from did_web where did={did:String} order by fetched_at desc limit 1', {"did": did})
+            ret_db = await db.db.query('select doc from did_web where did={did:String} order by fetched_at desc limit 1', {"did": did})
             try:
-                old_doc = ret.first_row[0]
+                old_doc = ret_db.first_row[0]
             except IndexError:
                 old_doc = ''
 
@@ -69,11 +68,11 @@ class DIDResolver:
                     did_doc,
                 )], settings={'async_insert': True})
 
-            ret = parse_did_doc(orjson.loads(did_doc))
+            ret_parsed = parse_did_doc(orjson.loads(did_doc))
             # todo insert?
-            if ret.did != did:
-                raise Exception("did:web document ID mismatch", did, ret.did)
-            return ret
+            if ret_parsed.did != did:
+                raise Exception("did:web document ID mismatch", did, ret_parsed.did)
+            return ret_parsed
 
         raise Exception("invalid did", did)
 

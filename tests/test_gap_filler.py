@@ -10,7 +10,6 @@ from datetime import datetime, UTC, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import aiohttp
-import httpx
 import pytest
 
 from goeoview.relay import RepoDownloadException

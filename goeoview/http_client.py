@@ -1,56 +1,47 @@
 from __future__ import annotations
 
-import httpx
+import aiohttp
 
-from .safe_transport import SafeTransport
+from .safe_transport import SafeResolver
 
 
 class HTTPClientManager:
-    def __init__(
-        self,
-        connect_timeout: float = 5.0,
-        read_timeout: float = 30.0,
-        dns_validation_timeout: float = 3.0,
-    ) -> None:
-        self._connect_timeout = connect_timeout
-        self._read_timeout = read_timeout
-        self._dns_validation_timeout = dns_validation_timeout
-        self._clients: dict[str, httpx.AsyncClient] = {}
+    def __init__(self, config) -> None:
+        self._config = config
+        self._sessions: dict[str, aiohttp.ClientSession] = {}
 
-    def _timeout(self) -> httpx.Timeout:
-        return httpx.Timeout(self._read_timeout, connect=self._connect_timeout)
+    def _timeout(self) -> aiohttp.ClientTimeout:
+        return aiohttp.ClientTimeout(
+            connect=self._config.http_connect_timeout,
+            sock_read=self._config.http_read_timeout,
+        )
 
-    def _build_trusted(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+    def _build_trusted(self) -> aiohttp.ClientSession:
+        return aiohttp.ClientSession(timeout=self._timeout())
+
+    def _build_untrusted(self) -> aiohttp.ClientSession:
+        connector = aiohttp.TCPConnector(
+            limit=1000,
+            limit_per_host=1,
+            resolver=SafeResolver(),
+        )
+        return aiohttp.ClientSession(
+            connector=connector,
             timeout=self._timeout(),
-            follow_redirects=True,
         )
 
-    def _build_untrusted(self) -> httpx.AsyncClient:
-        limits = httpx.Limits(
-            max_connections=1000,
-            max_keepalive_connections=200,
-        )
-        return httpx.AsyncClient(
-            transport=SafeTransport(
-                limits=limits,
-                validation_timeout=self._dns_validation_timeout,
-            ),
-            timeout=self._timeout(),
-            follow_redirects=False,
-        )
+    def trusted(self) -> aiohttp.ClientSession:
+        if "trusted" not in self._sessions:
+            self._sessions["trusted"] = self._build_trusted()
+        return self._sessions["trusted"]
 
-    def plc(self) -> httpx.AsyncClient:
-        return self._clients.setdefault("plc", self._build_trusted())
-
-    def did(self) -> httpx.AsyncClient:
-        return self._clients.setdefault("did", self._build_untrusted())
-
-    def repo(self) -> httpx.AsyncClient:
-        return self._clients.setdefault("repo", self._build_untrusted())
+    def untrusted(self) -> aiohttp.ClientSession:
+        if "untrusted" not in self._sessions:
+            self._sessions["untrusted"] = self._build_untrusted()
+        return self._sessions["untrusted"]
 
     async def close(self) -> None:
-        clients = list(self._clients.values())
-        self._clients.clear()
-        for client in clients:
-            await client.aclose()
+        sessions = list(self._sessions.values())
+        self._sessions.clear()
+        for session in sessions:
+            await session.close()

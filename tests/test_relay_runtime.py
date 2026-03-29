@@ -1,10 +1,18 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import cbrrr
 import pytest
-from httpx_ws._exceptions import WebSocketNetworkError
 
 from goeoview.helpers import sb32d
+
+
+def _make_ws_session(fake_ws):
+    """Create a mock aiohttp.ClientSession whose ws_connect returns fake_ws."""
+    mock_session = MagicMock()
+    mock_session.ws_connect = MagicMock(return_value=fake_ws)
+    mock_session.close = AsyncMock()
+    return mock_session
 
 
 class _FakeWS:
@@ -17,11 +25,11 @@ class _FakeWS:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def receive_bytes(self):
+    async def receive(self):
         self.calls += 1
         if self.calls == 1:
-            return b"payload"
-        raise WebSocketNetworkError("disconnect")
+            return aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, b"payload", None)
+        raise aiohttp.ClientError("disconnect")
 
 
 @pytest.mark.asyncio
@@ -35,7 +43,7 @@ async def test_start_firehose_retries_websocket_errors(mock_firehose):
         nonlocal call_count
         call_count += 1
         if call_count < 3:
-            raise WebSocketNetworkError("lost connection")
+            raise aiohttp.ClientError("lost connection")
         raise KeyboardInterrupt("stop test")
 
     mock_firehose.side_effect = side_effect
@@ -74,8 +82,9 @@ async def test_firehose_flushes_memory_before_reconnect(tmp_path):
 
     insert_mock = AsyncMock()
 
+    fake_ws = _FakeWS()
     with patch("goeoview.relay.DB", return_value=mock_db):
-        with patch("goeoview.relay.aconnect_ws", return_value=_FakeWS()):
+        with patch("goeoview.relay.aiohttp.ClientSession", return_value=_make_ws_session(fake_ws)):
             with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
                 with patch("goeoview.relay._decode_commit_header", return_value=fake_header):
                     with patch("goeoview.relay._process_batch", side_effect=fake_process_batch):
@@ -83,7 +92,7 @@ async def test_firehose_flushes_memory_before_reconnect(tmp_path):
                             from goeoview.quarantine import QuarantineStore
                             quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
                             mock_registry = MagicMock()
-                            with pytest.raises(WebSocketNetworkError):
+                            with pytest.raises(aiohttp.ClientError):
                                 await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
 
     insert_mock.assert_awaited_once()
@@ -205,8 +214,9 @@ async def test_cursor_does_not_advance_past_failed_batch(tmp_path):
 
     insert_mock = AsyncMock()
 
+    fake_ws = _FakeWS()
     with patch("goeoview.relay.DB", return_value=mock_db):
-        with patch("goeoview.relay.aconnect_ws", return_value=_FakeWS()):
+        with patch("goeoview.relay.aiohttp.ClientSession", return_value=_make_ws_session(fake_ws)):
             with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
                 with patch("goeoview.relay._decode_commit_header", return_value=fake_header):
                     with patch("goeoview.relay._process_batch", side_effect=exploding_process_batch):
@@ -346,11 +356,11 @@ class _TwoMessageWS:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def receive_bytes(self):
+    async def receive(self):
         if self._index < len(self._headers):
             self._index += 1
-            return b"payload"
-        raise WebSocketNetworkError("disconnect")
+            return aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, b"payload", None)
+        raise aiohttp.ClientError("disconnect")
 
 
 @pytest.mark.asyncio
@@ -385,8 +395,9 @@ async def test_naive_timestamp_quarantined(tmp_path):
 
     insert_mock = AsyncMock()
 
+    fake_ws = _TwoMessageWS(headers)
     with patch("goeoview.relay.DB", return_value=mock_db):
-        with patch("goeoview.relay.aconnect_ws", return_value=_TwoMessageWS(headers)):
+        with patch("goeoview.relay.aiohttp.ClientSession", return_value=_make_ws_session(fake_ws)):
             with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
                 with patch("goeoview.relay._decode_commit_header", side_effect=fake_decode_header):
                     with patch("goeoview.relay._process_batch", side_effect=fake_process_batch):
@@ -394,7 +405,7 @@ async def test_naive_timestamp_quarantined(tmp_path):
                             from goeoview.quarantine import QuarantineStore
                             quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
                             mock_registry = MagicMock()
-                            with pytest.raises(WebSocketNetworkError):
+                            with pytest.raises(aiohttp.ClientError):
                                 await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
 
     # The naive-timestamp commit should be quarantined
@@ -428,11 +439,11 @@ class _SyncThenDisconnectWS:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def receive_bytes(self):
+    async def receive(self):
         if not self._sent:
             self._sent = True
-            return self._msg
-        raise WebSocketNetworkError("disconnect")
+            return aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, self._msg, None)
+        raise aiohttp.ClientError("disconnect")
 
 
 @pytest.mark.asyncio
@@ -460,11 +471,11 @@ async def test_sync_message_inserts_gap(tmp_path):
     ws = _SyncThenDisconnectWS(sync_did, sync_rev, sync_seq)
 
     with patch("goeoview.relay.DB", return_value=mock_db):
-        with patch("goeoview.relay.aconnect_ws", return_value=ws):
+        with patch("goeoview.relay.aiohttp.ClientSession", return_value=_make_ws_session(ws)):
             from goeoview.quarantine import QuarantineStore
             quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
             mock_registry = MagicMock()
-            with pytest.raises(WebSocketNetworkError):
+            with pytest.raises(aiohttp.ClientError):
                 await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
 
     # Check that a gap was inserted for this DID
@@ -491,11 +502,11 @@ class _MultiMessageWS:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def receive_bytes(self):
+    async def receive(self):
         if self._index < self._count:
             self._index += 1
-            return b"payload"
-        raise WebSocketNetworkError("disconnect")
+            return aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, b"payload", None)
+        raise aiohttp.ClientError("disconnect")
 
 
 @pytest.mark.asyncio
@@ -521,8 +532,9 @@ async def test_duplicate_commit_seq_warns_and_skips(tmp_path):
 
     insert_mock = AsyncMock()
 
+    fake_ws = _MultiMessageWS(2)
     with patch("goeoview.relay.DB", return_value=mock_db):
-        with patch("goeoview.relay.aconnect_ws", return_value=_MultiMessageWS(2)):
+        with patch("goeoview.relay.aiohttp.ClientSession", return_value=_make_ws_session(fake_ws)):
             with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
                 with patch("goeoview.relay._decode_commit_header", return_value=dupe_header):
                     with patch("goeoview.relay._process_batch", side_effect=fake_process_batch):
@@ -531,7 +543,7 @@ async def test_duplicate_commit_seq_warns_and_skips(tmp_path):
                             quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
                             mock_registry = MagicMock()
                             # Should NOT raise — duplicate seq should be skipped
-                            with pytest.raises(WebSocketNetworkError):
+                            with pytest.raises(aiohttp.ClientError):
                                 await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
 
     # Only 1 commit should have been processed (the duplicate skipped)
@@ -572,11 +584,11 @@ async def test_duplicate_sync_seq_warns_and_skips(tmp_path):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def receive_bytes(self):
+        async def receive(self):
             self._calls += 1
             if self._calls <= 2:
-                return sync_msg
-            raise WebSocketNetworkError("disconnect")
+                return aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, sync_msg, None)
+            raise aiohttp.ClientError("disconnect")
 
     mock_db = MagicMock()
     mock_db.db.query = AsyncMock(return_value=MagicMock(row_count=0))
@@ -590,12 +602,12 @@ async def test_duplicate_sync_seq_warns_and_skips(tmp_path):
     mock_config.firehose_batch_timeout = None
 
     with patch("goeoview.relay.DB", return_value=mock_db):
-        with patch("goeoview.relay.aconnect_ws", return_value=_DupeSyncWS()):
+        with patch("goeoview.relay.aiohttp.ClientSession", return_value=_make_ws_session(_DupeSyncWS())):
             from goeoview.quarantine import QuarantineStore
             quarantine = QuarantineStore(str(tmp_path / "quarantine.db"))
             mock_registry = MagicMock()
             # Should NOT raise — duplicate sync seq should be skipped
-            with pytest.raises(WebSocketNetworkError):
+            with pytest.raises(aiohttp.ClientError):
                 await firehose("bsky.network", MagicMock(), mock_config, quarantine, None, mock_registry)
 
     # Only 1 gap should have been inserted (the duplicate skipped)
@@ -635,8 +647,9 @@ async def test_truly_non_monotonic_seq_still_raises(tmp_path):
     async def fake_process_batch(batch, memory, *args, **kwargs):
         pass
 
+    fake_ws = _MultiMessageWS(2)
     with patch("goeoview.relay.DB", return_value=mock_db):
-        with patch("goeoview.relay.aconnect_ws", return_value=_MultiMessageWS(2)):
+        with patch("goeoview.relay.aiohttp.ClientSession", return_value=_make_ws_session(fake_ws)):
             with patch("goeoview.relay.parse_firehose_message_type", return_value=("commit", b"body")):
                 with patch("goeoview.relay._decode_commit_header", side_effect=fake_decode):
                     with patch("goeoview.relay._process_batch", side_effect=fake_process_batch):

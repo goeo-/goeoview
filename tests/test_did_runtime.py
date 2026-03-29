@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from goeoview.did import DIDResolver, AtprotoUser
+from goeoview.did import DIDResolver
 from goeoview.plc_store import PLCStateStore
 from goeoview.http_client import HTTPClientManager
 
@@ -36,9 +36,9 @@ async def test_resolve_plc_falls_back_to_live_directory_after_db_retries(tmp_pat
     store = PLCStateStore(str(tmp_path / "plc_state.db"))
     # store has no data — get_latest returns None
 
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.json.return_value = {
+    mock_response = AsyncMock()
+    mock_response.status = 200
+    mock_response.json = AsyncMock(return_value={
         "id": "did:plc:test123",
         "alsoKnownAs": ["at://alice.test"],
         "service": [
@@ -56,13 +56,17 @@ async def test_resolve_plc_falls_back_to_live_directory_after_db_retries(tmp_pat
                 "publicKeyMultibase": "zTest123",
             }
         ],
-    }
+    })
 
-    mock_client = MagicMock()
-    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = MagicMock()
+    mock_session.get = MagicMock(return_value=mock_ctx)
 
     http = MagicMock(spec=HTTPClientManager)
-    http.did.return_value = mock_client
+    http.trusted.return_value = mock_session
 
     resolver = DIDResolver(http, store)
 

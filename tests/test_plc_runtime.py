@@ -1,8 +1,9 @@
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import orjson
 import pytest
-from httpx_ws._exceptions import WebSocketNetworkError
 
 from goeoview.config import Config
 
@@ -35,16 +36,35 @@ async def test_backfill_export_updates_cursor(tmp_path):
         },
     }
 
-    response_with_data = MagicMock(status_code=200, content=orjson.dumps(record) + b"\n")
-    empty_response = MagicMock(status_code=200, content=b"")
+    response_body_data = orjson.dumps(record) + b"\n"
+    response_body_empty = b""
+
+    @asynccontextmanager
+    async def _resp(status, body):
+        resp = MagicMock(status=status)
+        resp.read = AsyncMock(return_value=body)
+        yield resp
+
+    call_count = 0
+
+    @asynccontextmanager
+    async def _fake_get(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            async with _resp(200, response_body_data) as r:
+                yield r
+        else:
+            async with _resp(200, response_body_empty) as r:
+                yield r
 
     store = PLCStateStore(str(tmp_path / "plc_state.db"))
     config = Config()
 
     mock_http = MagicMock()
-    mock_client = MagicMock()
-    mock_client.get = AsyncMock(side_effect=[response_with_data, empty_response])
-    mock_http.plc.return_value = mock_client
+    mock_session = MagicMock()
+    mock_session.get = _fake_get
+    mock_http.trusted.return_value = mock_session
 
     with patch("goeoview.plc.fetch_prev_records", new=AsyncMock(return_value={})):
         with patch("goeoview.plc.validate_records", return_value=[]):
@@ -62,15 +82,22 @@ async def test_backfill_export_accepts_timestamp_cursor(tmp_path):
     mock_db = MagicMock()
     mock_db.db.insert = AsyncMock()
 
-    empty_response = MagicMock(status_code=200, content=b"")
+    get_calls = []
+
+    @asynccontextmanager
+    async def _fake_get(*args, **kwargs):
+        get_calls.append((args, kwargs))
+        resp = MagicMock(status=200)
+        resp.read = AsyncMock(return_value=b"")
+        yield resp
 
     store = PLCStateStore(str(tmp_path / "plc_state.db"))
     config = Config()
 
     mock_http = MagicMock()
-    mock_client = MagicMock()
-    mock_client.get = AsyncMock(return_value=empty_response)
-    mock_http.plc.return_value = mock_client
+    mock_session = MagicMock()
+    mock_session.get = _fake_get
+    mock_http.trusted.return_value = mock_session
 
     cursor = await backfill_export(
         mock_db,
@@ -82,9 +109,10 @@ async def test_backfill_export_accepts_timestamp_cursor(tmp_path):
     )
 
     assert cursor == "2025-04-03T17:34:59.442Z"
-    mock_client.get.assert_awaited_once_with(
-        "https://plc.directory/export",
-        params={"count": config.plc_poller_count, "after": "2025-04-03T17:34:59.442Z"},
+    assert len(get_calls) == 1
+    assert get_calls[0] == (
+        ("https://plc.directory/export",),
+        {"params": {"count": config.plc_poller_count, "after": "2025-04-03T17:34:59.442Z"}},
     )
 
 
@@ -108,11 +136,31 @@ def test_export_target_interval_is_positive():
     assert config.plc_export_target_interval > 0
 
 
+class _WSContextManager:
+    """Async context manager wrapper that yields the given ws mock."""
+
+    def __init__(self, ws):
+        self._ws = ws
+
+    async def __aenter__(self):
+        return self._ws
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+def _make_ws_session(fake_ws):
+    """Create a mock aiohttp.ClientSession whose ws_connect returns fake_ws."""
+    mock_session = MagicMock()
+    mock_session.ws_connect = MagicMock(return_value=_WSContextManager(fake_ws))
+    mock_session.close = AsyncMock()
+    return mock_session
+
+
 @pytest.mark.asyncio
 async def test_stream_export_logs_connect_and_batched_ingest(tmp_path, caplog):
     """Batched logging: flush on disconnect with records < 1000 and elapsed < 5s."""
     import logging
-    from contextlib import asynccontextmanager
 
     from goeoview.plc import stream_export
     from goeoview.plc_store import PLCStateStore
@@ -125,26 +173,24 @@ async def test_stream_export_logs_connect_and_batched_ingest(tmp_path, caplog):
         {"did": "did:plc:bbb", "seq": 11, "operation": {}},
     ]
 
-    mock_ws = AsyncMock()
     messages = [orjson.dumps(r).decode() for r in records]
-    mock_ws.receive_text = AsyncMock(
-        side_effect=messages + [WebSocketNetworkError()]
-    )
+    receive_results = [
+        aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, m, None) for m in messages
+    ] + [aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, None, None)]
 
-    @asynccontextmanager
-    async def fake_aconnect_ws(url, client=None):
-        yield mock_ws
+    mock_ws = AsyncMock()
+    mock_ws.receive = AsyncMock(side_effect=receive_results)
 
     store = PLCStateStore(str(tmp_path / "plc_state.db"))
     config = Config()
 
     with (
-        patch("goeoview.plc.aconnect_ws", fake_aconnect_ws),
+        patch("goeoview.plc.aiohttp.ClientSession", return_value=_make_ws_session(mock_ws)),
         patch("goeoview.plc.fetch_prev_records", new=AsyncMock(return_value={})),
         patch("goeoview.plc.validate_records", return_value=[]),
         caplog.at_level(logging.INFO, logger="goeoview.plc"),
     ):
-        with pytest.raises(WebSocketNetworkError):
+        with pytest.raises(aiohttp.ClientError):
             await stream_export(mock_db, MagicMock(), 5, config, store)
 
     log_messages = [r.message for r in caplog.records if r.name == "goeoview.plc"]
@@ -172,7 +218,6 @@ async def test_stream_export_logs_connect_and_batched_ingest(tmp_path, caplog):
 async def test_stream_export_logs_batch_at_count_threshold(tmp_path, caplog):
     """Logs a batch summary every 1000 records."""
     import logging
-    from contextlib import asynccontextmanager
 
     from goeoview.plc import STREAM_LOG_BATCH_SIZE, stream_export
     from goeoview.plc_store import PLCStateStore
@@ -186,26 +231,24 @@ async def test_stream_export_logs_batch_at_count_threshold(tmp_path, caplog):
         for i in range(num_records)
     ]
 
-    mock_ws = AsyncMock()
     messages = [orjson.dumps(r).decode() for r in records]
-    mock_ws.receive_text = AsyncMock(
-        side_effect=messages + [WebSocketNetworkError()]
-    )
+    receive_results = [
+        aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, m, None) for m in messages
+    ] + [aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, None, None)]
 
-    @asynccontextmanager
-    async def fake_aconnect_ws(url, client=None):
-        yield mock_ws
+    mock_ws = AsyncMock()
+    mock_ws.receive = AsyncMock(side_effect=receive_results)
 
     store = PLCStateStore(str(tmp_path / "plc_state.db"))
     config = Config()
 
     with (
-        patch("goeoview.plc.aconnect_ws", fake_aconnect_ws),
+        patch("goeoview.plc.aiohttp.ClientSession", return_value=_make_ws_session(mock_ws)),
         patch("goeoview.plc.fetch_prev_records", new=AsyncMock(return_value={})),
         patch("goeoview.plc.validate_records", return_value=[]),
         caplog.at_level(logging.INFO, logger="goeoview.plc"),
     ):
-        with pytest.raises(WebSocketNetworkError):
+        with pytest.raises(aiohttp.ClientError):
             await stream_export(mock_db, MagicMock(), 50, config, store)
 
     log_messages = [r.message for r in caplog.records if r.name == "goeoview.plc"]
@@ -221,7 +264,6 @@ async def test_stream_export_logs_batch_at_count_threshold(tmp_path, caplog):
 async def test_stream_export_logs_batch_at_time_threshold(tmp_path, caplog):
     """Logs a batch summary every 5 seconds."""
     import logging
-    from contextlib import asynccontextmanager
 
     from goeoview.plc import stream_export
     from goeoview.plc_store import PLCStateStore
@@ -235,15 +277,13 @@ async def test_stream_export_logs_batch_at_time_threshold(tmp_path, caplog):
         {"did": "did:plc:ccc", "seq": 12, "operation": {}},
     ]
 
-    mock_ws = AsyncMock()
     messages = [orjson.dumps(r).decode() for r in records]
-    mock_ws.receive_text = AsyncMock(
-        side_effect=messages + [WebSocketNetworkError()]
-    )
+    receive_results = [
+        aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, m, None) for m in messages
+    ] + [aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, None, None)]
 
-    @asynccontextmanager
-    async def fake_aconnect_ws(url, client=None):
-        yield mock_ws
+    mock_ws = AsyncMock()
+    mock_ws.receive = AsyncMock(side_effect=receive_results)
 
     store = PLCStateStore(str(tmp_path / "plc_state.db"))
     config = Config()
@@ -293,13 +333,13 @@ async def test_stream_export_logs_batch_at_time_threshold(tmp_path, caplog):
     ])
 
     with (
-        patch("goeoview.plc.aconnect_ws", fake_aconnect_ws),
+        patch("goeoview.plc.aiohttp.ClientSession", return_value=_make_ws_session(mock_ws)),
         patch("goeoview.plc.fetch_prev_records", new=AsyncMock(return_value={})),
         patch("goeoview.plc.validate_records", return_value=[]),
         patch("goeoview.plc.perf_counter", side_effect=lambda: next(time_values)),
         caplog.at_level(logging.INFO, logger="goeoview.plc"),
     ):
-        with pytest.raises(WebSocketNetworkError):
+        with pytest.raises(aiohttp.ClientError):
             await stream_export(mock_db, MagicMock(), 5, config, store)
 
     log_messages = [r.message for r in caplog.records if r.name == "goeoview.plc"]

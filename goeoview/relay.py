@@ -1,9 +1,7 @@
 import cbrrr
 import orjson
 
-import httpx
-from httpx_ws import aconnect_ws
-from httpx_ws._exceptions import WebSocketNetworkError
+import aiohttp
 
 from datetime import datetime, UTC, timedelta
 from collections import deque
@@ -313,18 +311,24 @@ async def firehose(firehose_url, did_resolver, config, quarantine, pool, registr
     loop = asyncio.get_running_loop()
     batch = []
 
-    ws_client = httpx.AsyncClient(timeout=httpx.Timeout(config.ws_connect_timeout))
+    timeout = aiohttp.ClientTimeout(connect=config.ws_connect_timeout)
+    session = aiohttp.ClientSession(timeout=timeout)
     try:
-        async with aconnect_ws(
+        async with session.ws_connect(
             f"wss://{firehose_url}/xrpc/com.atproto.sync.subscribeRepos?cursor={fh_cursor}",
-            client=ws_client,
         ) as ws:
             while True:
                 try:
-                    message = await asyncio.wait_for(
-                        ws.receive_bytes(),
+                    msg = await asyncio.wait_for(
+                        ws.receive(),
                         timeout=config.firehose_batch_timeout if batch else None,
                     )
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING,
+                                    aiohttp.WSMsgType.CLOSED):
+                        raise aiohttp.ClientError("WebSocket closed")
+                    if msg.type == aiohttp.WSMsgType.ERROR:
+                        raise aiohttp.ClientError(f"WebSocket error: {ws.exception()}")
+                    message = msg.data
                 except asyncio.TimeoutError:
                     if batch:
                         await _process_batch(batch, memory, did_resolver, config, loop, pool, validate_commit, quarantine, user_map=user_map)
@@ -415,7 +419,7 @@ async def firehose(firehose_url, did_resolver, config, quarantine, pool, registr
         if memory:
             hook_rows = await insert_commits(db, memory, firehose_url, last_safe_seq, user_map=user_map)
             registry.dispatch(hook_rows)
-        await ws_client.aclose()
+        await session.close()
 
 async def start_firehose(firehose_url, did_resolver, config):
     from .quarantine import QuarantineStore
@@ -431,7 +435,7 @@ async def start_firehose(firehose_url, did_resolver, config):
             try:
                 await firehose(firehose_url, did_resolver, config, quarantine, pool, registry)
 
-            except WebSocketNetworkError:
+            except aiohttp.ClientError:
                 logger.warning("websocket error, retrying")
                 await asyncio.sleep(1)
     finally:

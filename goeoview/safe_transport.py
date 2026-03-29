@@ -1,40 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import socket
 from typing import List
-from urllib.parse import urlparse
 
 import aiohttp
 import aiohttp.abc
 import aiohttp.resolver
-import httpx
-
-
-def validate_url_host(url: str) -> None:
-    """Resolve the hostname from a URL and reject if any resolved IP is non-public."""
-    parsed = urlparse(url)
-    hostname = parsed.hostname
-    port = parsed.port
-
-    if not hostname:
-        raise ValueError(f"no hostname in URL: {url}")
-
-    try:
-        results = socket.getaddrinfo(hostname, port)
-    except socket.gaierror as exc:
-        raise ValueError(f"DNS resolution failed for {hostname}: {exc}") from exc
-
-    if not results:
-        raise ValueError(f"{hostname} resolved to no addresses")
-
-    for family, _type, _proto, _canonname, sockaddr in results:
-        addr = ipaddress.ip_address(sockaddr[0])
-        if not addr.is_global:
-            raise ValueError(
-                f"non-public IP {addr} for host {hostname}"
-            )
+import orjson
+from yarl import URL
 
 
 class SafeResolver(aiohttp.abc.AbstractResolver):
@@ -67,56 +41,52 @@ class SafeResolver(aiohttp.abc.AbstractResolver):
         await self._inner.close()
 
 
-async def async_validate_url_host(url: str, timeout: float = 3.0) -> None:
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(validate_url_host, url),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError as exc:
-        hostname = urlparse(url).hostname or "<unknown>"
-        raise ValueError(
-            f"DNS validation timed out for {hostname} after {timeout}s"
-        ) from exc
+class SafeGetResponse:
+    """Response from safe_get with .status, .headers, .body, .text, .json()."""
 
+    __slots__ = ["status", "headers", "body"]
 
-class SafeTransport(httpx.AsyncHTTPTransport):
-    """AsyncHTTPTransport that validates all destination IPs are public."""
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+        self.body = body
 
-    def __init__(self, *args, validation_timeout: float = 3.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._validation_timeout = validation_timeout
+    @property
+    def text(self):
+        return self.body.decode()
 
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        await async_validate_url_host(
-            str(request.url), timeout=self._validation_timeout
-        )
-        return await super().handle_async_request(request)
+    def json(self):
+        return orjson.loads(self.body)
 
 
 async def safe_get(
-    client: httpx.AsyncClient,
+    session: aiohttp.ClientSession,
     url: str,
     *,
     max_redirects: int = 5,
     max_response_bytes: int = 1_048_576,
-    validation_timeout: float = 3.0,
-) -> httpx.Response:
-    """Follow redirects manually, validating each hop against SSRF.
+) -> SafeGetResponse:
+    """Follow redirects manually with SSRF validation via the session's connector.
 
-    Uses streaming reads to enforce max_response_bytes before buffering.
+    The session must use a TCPConnector with SafeResolver so every connection
+    (including redirect targets) is validated at DNS resolution time.
+
+    Enforces max_response_bytes via streaming reads.
     """
     for _ in range(max_redirects + 1):
-        await async_validate_url_host(url, timeout=validation_timeout)
-        async with client.stream("GET", url) as response:
-            if response.has_redirect_location:
-                location = response.headers["location"]
-                url = str(httpx.URL(url).join(location))
-                continue
+        response = await session.get(url, allow_redirects=False)
+        if response.status in (301, 302, 303, 307, 308):
+            location = response.headers.get("location")
+            await response.release()
+            if location is None:
+                raise ValueError("redirect with no location header")
+            url = str(URL(url).join(URL(location)))
+            continue
 
+        try:
             chunks = []
             total = 0
-            async for chunk in response.aiter_bytes():
+            async for chunk in response.content.iter_any():
                 total += len(chunk)
                 if total > max_response_bytes:
                     raise ValueError(
@@ -124,33 +94,12 @@ async def safe_get(
                     )
                 chunks.append(chunk)
 
-            # Build a response-like object with .content, .status_code, .headers, .json()
-            return _BufferedResponse(
-                status_code=response.status_code,
+            return SafeGetResponse(
+                status=response.status,
                 headers=response.headers,
-                content=b"".join(chunks),
+                body=b"".join(chunks),
             )
+        finally:
+            await response.release()
 
     raise ValueError(f"too many redirects (>{max_redirects})")
-
-
-class _BufferedResponse:
-    """Minimal response wrapper for safe_get results.
-
-    Not a real httpx.Response — only supports status_code, headers,
-    content, text, and json(). Don't pass this to code expecting the
-    full httpx response interface.
-    """
-
-    def __init__(self, status_code, headers, content):
-        self.status_code = status_code
-        self.headers = headers
-        self.content = content
-
-    @property
-    def text(self):
-        return self.content.decode()
-
-    def json(self):
-        import orjson
-        return orjson.loads(self.content)
