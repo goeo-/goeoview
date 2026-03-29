@@ -69,7 +69,7 @@ async def test_firehose_flushes_memory_before_reconnect(tmp_path):
     fake_header = {"seq": 5, "repo": "did:plc:test", "time": "2025-01-01T00:00:00+00:00"}
     fake_rows = [("did:plc:test", "app.bsky.feed.post", "abc", 1, b"{}", None, "create")]
 
-    async def fake_process_batch(batch, memory, did_resolver, config, loop, pool, _validate_commit, quarantine=None):
+    async def fake_process_batch(batch, memory, did_resolver, config, loop, pool, _validate_commit, quarantine=None, **kwargs):
         memory.extend(fake_rows)
 
     insert_mock = AsyncMock()
@@ -689,3 +689,48 @@ async def test_insert_commits_null_since_known_did():
     assert len(gap_calls) == 1
     gap_rows = gap_calls[0].args[1]
     assert gap_rows == []
+
+
+@pytest.mark.asyncio
+async def test_insert_commits_includes_user_in_hook_rows():
+    """When a user_map is provided, hook_rows should include the user object."""
+    from collections import deque
+    from goeoview.relay import insert_commits
+
+    mock_db = MagicMock()
+    mock_db.db.query = AsyncMock(return_value=MagicMock(result_rows=[]))
+    mock_db.db.insert = AsyncMock()
+
+    did = "did:plc:abc"
+    fake_user = MagicMock()
+    fake_user.did = did
+    fake_user.handle = "alice.test"
+    user_map = {did: fake_user}
+
+    memory = deque([(did, "app.bsky.feed.post", "rkey1", 100, b'{"text":"hi"}', None, "create")])
+
+    hook_rows = await insert_commits(mock_db, memory, "wss://example.com", 1, user_map=user_map)
+
+    assert len(hook_rows) == 1
+    assert hook_rows[0]["user"] is fake_user
+
+
+@pytest.mark.asyncio
+async def test_insert_commits_user_none_when_not_in_map():
+    """When user_map is provided but DID is missing, user should be None."""
+    from collections import deque
+    from goeoview.relay import insert_commits
+
+    mock_db = MagicMock()
+    mock_db.db.query = AsyncMock(return_value=MagicMock(result_rows=[]))
+    mock_db.db.insert = AsyncMock()
+
+    did = "did:plc:unknown"
+    user_map = {}
+
+    memory = deque([(did, "app.bsky.feed.post", "rkey1", 100, b'{"text":"hi"}', None, "create")])
+
+    hook_rows = await insert_commits(mock_db, memory, "wss://example.com", 1, user_map=user_map)
+
+    assert len(hook_rows) == 1
+    assert hook_rows[0]["user"] is None

@@ -2,11 +2,14 @@
 
 import asyncio
 import ssl
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, UTC, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import aiohttp
 import httpx
 import pytest
 
@@ -26,32 +29,32 @@ def _make_config(max_repo_size=10 * 1024 * 1024):
     return config
 
 
-def _make_stream_response(status_code=200, body=b"car-data", headers=None):
-    """Build a fake async streaming response."""
+def _make_aiohttp_response(status=200, body=b"car-data", headers=None):
+    """Build a fake aiohttp-style streaming response."""
     response = MagicMock()
-    response.status_code = status_code
+    response.status = status
     response.headers = headers or {"content-type": "application/vnd.ipld.car"}
 
-    async def aiter_bytes():
+    async def iter_any():
         yield body
 
-    response.aiter_bytes = aiter_bytes
-    response.aread = AsyncMock()
+    content = MagicMock()
+    content.iter_any = iter_any
+    response.content = content
+    response.read = AsyncMock(return_value=body)
+    response.release = AsyncMock()
     return response
 
 
-def _make_http_clients(response):
-    """Build http_clients mock whose .repo().stream() yields *response*."""
+def _make_session(response):
+    """Build a mock aiohttp session whose .get() yields *response*."""
     @asynccontextmanager
-    async def fake_stream(method, url):
+    async def fake_get(url, **kwargs):
         yield response
 
-    client = MagicMock()
-    client.stream = fake_stream
-
-    http_clients = MagicMock()
-    http_clients.repo.return_value = client
-    return http_clients
+    session = MagicMock()
+    session.get = fake_get
+    return session
 
 
 class TestDownloadOneSuccess:
@@ -62,17 +65,50 @@ class TestDownloadOneSuccess:
         resolver = AsyncMock()
         resolver.resolve.return_value = user
 
-        resp = _make_stream_response(200, b"car-bytes", {"x-custom": "val"})
-        http_clients = _make_http_clients(resp)
+        resp = _make_aiohttp_response(200, b"car-bytes", {"x-custom": "val"})
+        session = _make_session(resp)
         config = _make_config()
 
         result_user, car_bytes, headers = await download_one(
-            "did:plc:test123", resolver, http_clients, config
+            "did:plc:test123", resolver, session, config
         )
 
         assert result_user is user
         assert car_bytes == b"car-bytes"
         assert headers["x-custom"] == "val"
+
+    async def test_uses_grouped_pds_host_for_repo_download(self):
+        from goeoview.gap_filler import download_one
+
+        user = _make_user(pds="https://wrong.example.com")
+        resolver = AsyncMock()
+        resolver.resolve.return_value = user
+
+        captured = {}
+
+        @asynccontextmanager
+        async def fake_get(url, **kwargs):
+            captured["url"] = url
+            yield _make_aiohttp_response(200, b"car-bytes", {"x-custom": "val"})
+
+        session = MagicMock()
+        session.get = fake_get
+        config = _make_config()
+
+        result_user, car_bytes, headers = await download_one(
+            "did:plc:test123",
+            resolver,
+            session,
+            config,
+            pds_host="https://grouped.example.com",
+        )
+
+        assert result_user is user
+        assert car_bytes == b"car-bytes"
+        assert headers["x-custom"] == "val"
+        assert captured["url"].startswith(
+            "https://grouped.example.com/xrpc/com.atproto.sync.getRepo"
+        )
 
 
 class TestDownloadOnePdsValidation:
@@ -88,6 +124,7 @@ class TestDownloadOnePdsValidation:
             await download_one("did:plc:test123", resolver, MagicMock(), config)
 
         assert exc_info.value.user is user
+        assert exc_info.value.stage == "pds_validation"
 
     async def test_pds_not_https_raises(self):
         from goeoview.gap_filler import download_one
@@ -101,6 +138,37 @@ class TestDownloadOnePdsValidation:
             await download_one("did:plc:test123", resolver, MagicMock(), config)
 
         assert exc_info.value.user is user
+        assert exc_info.value.stage == "pds_validation"
+
+    async def test_ssrf_rejection_from_resolver(self):
+        """SSRF protection is handled by SafeResolver at the connector level.
+
+        When the resolver rejects a non-public IP, aiohttp raises a
+        ClientConnectorError which download_one wraps in RepoDownloadException.
+        """
+        from goeoview.gap_filler import download_one
+
+        user = _make_user(pds="https://evil.example.com")
+        resolver = AsyncMock()
+        resolver.resolve.return_value = user
+        config = _make_config()
+
+        @asynccontextmanager
+        async def raising_get(url, **kwargs):
+            raise aiohttp.ClientConnectorError(
+                connection_key=MagicMock(),
+                os_error=OSError("non-public IP"),
+            )
+            yield  # noqa
+
+        session = MagicMock()
+        session.get = raising_get
+
+        with pytest.raises(RepoDownloadException) as exc_info:
+            await download_one("did:plc:test123", resolver, session, config)
+
+        assert exc_info.value.stage == "request"
+        assert isinstance(exc_info.value.cause, aiohttp.ClientConnectorError)
 
 
 class TestDownloadOneHttpErrors:
@@ -112,8 +180,8 @@ class TestDownloadOneHttpErrors:
         resolver = AsyncMock()
         resolver.resolve.return_value = user
 
-        resp = _make_stream_response(status_code)
-        http_clients = _make_http_clients(resp)
+        resp = _make_aiohttp_response(status_code)
+        session = _make_session(resp)
         config = _make_config()
 
         mock_db = MagicMock()
@@ -121,11 +189,14 @@ class TestDownloadOneHttpErrors:
 
         with patch("goeoview.gap_filler.DB", return_value=mock_db):
             with pytest.raises(RepoDownloadException) as exc_info:
-                await download_one("did:plc:test123", resolver, http_clients, config)
+                await download_one("did:plc:test123", resolver, session, config)
 
         assert exc_info.value.status_code == status_code
+        assert exc_info.value.stage == "http_response"
         mock_db.db.insert.assert_awaited_once_with(
-            "bad_did", [(user.did, status_code)]
+            "bad_did",
+            [(user.did, status_code)],
+            column_names=["did", "status_code"],
         )
 
     @pytest.mark.parametrize("status_code", [500, 502, 503])
@@ -136,8 +207,8 @@ class TestDownloadOneHttpErrors:
         resolver = AsyncMock()
         resolver.resolve.return_value = user
 
-        resp = _make_stream_response(status_code)
-        http_clients = _make_http_clients(resp)
+        resp = _make_aiohttp_response(status_code)
+        session = _make_session(resp)
         config = _make_config()
 
         mock_db = MagicMock()
@@ -145,9 +216,10 @@ class TestDownloadOneHttpErrors:
 
         with patch("goeoview.gap_filler.DB", return_value=mock_db):
             with pytest.raises(RepoDownloadException) as exc_info:
-                await download_one("did:plc:test123", resolver, http_clients, config)
+                await download_one("did:plc:test123", resolver, session, config)
 
         assert exc_info.value.status_code == status_code
+        assert exc_info.value.stage == "http_response"
         mock_db.db.insert.assert_not_awaited()
 
     async def test_429_raises_with_headers(self):
@@ -158,8 +230,8 @@ class TestDownloadOneHttpErrors:
         resolver.resolve.return_value = user
 
         headers = {"retry-after": "30", "ratelimit-remaining": "0"}
-        resp = _make_stream_response(429, headers=headers)
-        http_clients = _make_http_clients(resp)
+        resp = _make_aiohttp_response(429, headers=headers)
+        session = _make_session(resp)
         config = _make_config()
 
         mock_db = MagicMock()
@@ -167,16 +239,17 @@ class TestDownloadOneHttpErrors:
 
         with patch("goeoview.gap_filler.DB", return_value=mock_db):
             with pytest.raises(RepoDownloadException) as exc_info:
-                await download_one("did:plc:test123", resolver, http_clients, config)
+                await download_one("did:plc:test123", resolver, session, config)
 
         assert exc_info.value.status_code == 429
         assert exc_info.value.headers["retry-after"] == "30"
+        assert exc_info.value.stage == "http_response"
 
 
 class TestDownloadOneConnectionErrors:
     @pytest.mark.parametrize("error_cls", [
-        httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError,
-        httpx.ReadTimeout, httpx.RemoteProtocolError,
+        aiohttp.ClientConnectorError,
+        aiohttp.ServerDisconnectedError,
     ])
     async def test_connection_error_raises_with_no_status(self, error_cls):
         from goeoview.gap_filler import download_one
@@ -186,21 +259,48 @@ class TestDownloadOneConnectionErrors:
         resolver.resolve.return_value = user
 
         @asynccontextmanager
-        async def raising_stream(method, url):
-            raise error_cls("boom")
-            yield  # noqa: unreachable, needed for asynccontextmanager
+        async def raising_get(url, **kwargs):
+            if error_cls is aiohttp.ClientConnectorError:
+                raise error_cls(
+                    connection_key=MagicMock(), os_error=OSError("boom")
+                )
+            raise error_cls(message="boom")
+            yield  # noqa: unreachable
 
-        client = MagicMock()
-        client.stream = raising_stream
-        http_clients = MagicMock()
-        http_clients.repo.return_value = client
+        session = MagicMock()
+        session.get = raising_get
         config = _make_config()
 
         with pytest.raises(RepoDownloadException) as exc_info:
-            await download_one("did:plc:test123", resolver, http_clients, config)
+            await download_one("did:plc:test123", resolver, session, config)
 
         assert exc_info.value.status_code is None
         assert exc_info.value.user is user
+        assert exc_info.value.stage == "request"
+        assert isinstance(exc_info.value.cause, error_cls)
+
+    async def test_timeout_error_raises_with_no_status(self):
+        from goeoview.gap_filler import download_one
+
+        user = _make_user()
+        resolver = AsyncMock()
+        resolver.resolve.return_value = user
+
+        @asynccontextmanager
+        async def raising_get(url, **kwargs):
+            raise asyncio.TimeoutError()
+            yield  # noqa
+
+        session = MagicMock()
+        session.get = raising_get
+        config = _make_config()
+
+        with pytest.raises(RepoDownloadException) as exc_info:
+            await download_one("did:plc:test123", resolver, session, config)
+
+        assert exc_info.value.status_code is None
+        assert exc_info.value.stage == "request"
+        assert isinstance(exc_info.value.cause, asyncio.TimeoutError)
 
     async def test_ssl_error_raises_with_no_status(self):
         from goeoview.gap_filler import download_one
@@ -210,27 +310,32 @@ class TestDownloadOneConnectionErrors:
         resolver.resolve.return_value = user
 
         @asynccontextmanager
-        async def raising_stream(method, url):
+        async def raising_get(url, **kwargs):
             raise ssl.SSLError("cert verify failed")
             yield  # noqa
 
-        client = MagicMock()
-        client.stream = raising_stream
-        http_clients = MagicMock()
-        http_clients.repo.return_value = client
+        session = MagicMock()
+        session.get = raising_get
         config = _make_config()
 
         with pytest.raises(RepoDownloadException) as exc_info:
-            await download_one("did:plc:test123", resolver, http_clients, config)
+            await download_one("did:plc:test123", resolver, session, config)
 
         assert exc_info.value.status_code is None
+        assert exc_info.value.stage == "request"
+        assert isinstance(exc_info.value.cause, ssl.SSLError)
 
 
 class TestAdjustTarget:
-    def test_no_rate_limit_headers_returns_unchanged(self):
+    def test_no_rate_limit_headers_ramps_up(self):
         from goeoview.gap_filler import adjust_target
 
-        assert adjust_target({}, current_target=4, max_target=8) == 4
+        assert adjust_target({}, current_target=4, max_target=8) == 5
+
+    def test_no_rate_limit_headers_capped_at_max(self):
+        from goeoview.gap_filler import adjust_target
+
+        assert adjust_target({}, current_target=8, max_target=8) == 8
 
     def test_remaining_above_50_percent_increases_by_one(self):
         from goeoview.gap_filler import adjust_target
@@ -274,15 +379,15 @@ class TestAdjustTarget:
         assert adjust_target(
             {"ratelimit-remaining": "30"},
             current_target=4, max_target=8
-        ) == 4
+        ) == 5
 
-    def test_non_numeric_headers_return_unchanged(self):
+    def test_non_numeric_headers_ramps_up(self):
         from goeoview.gap_filler import adjust_target
 
         assert adjust_target(
             {"ratelimit-remaining": "lots", "ratelimit-limit": "many"},
             current_target=4, max_target=8
-        ) == 4
+        ) == 5
 
 
 class TestDownloadOneMaxSize:
@@ -294,12 +399,12 @@ class TestDownloadOneMaxSize:
         resolver.resolve.return_value = user
 
         big_body = b"x" * 1001
-        resp = _make_stream_response(200, big_body)
-        http_clients = _make_http_clients(resp)
+        resp = _make_aiohttp_response(200, big_body)
+        session = _make_session(resp)
         config = _make_config(max_repo_size=1000)
 
         with pytest.raises(RepoDownloadException) as exc_info:
-            await download_one("did:plc:test123", resolver, http_clients, config)
+            await download_one("did:plc:test123", resolver, session, config)
 
         assert exc_info.value.user is user
 
@@ -334,8 +439,9 @@ class TestFlushStagingBatch:
         # insert into staging
         db.db.insert.assert_awaited_once_with("staging", rows)
 
-        # dedup INSERT SELECT, deletion INSERT SELECT, DELETE FROM gap, TRUNCATE
-        assert db.db.command.await_count == 4
+        # truncate(cleanup), dedup INSERT SELECT, deletion INSERT SELECT,
+        # DELETE FROM gap, TRUNCATE(final)
+        assert db.db.command.await_count == 5
 
     async def test_dedup_sql_selects_from_staging_joins_commit(self):
         from goeoview.gap_filler import flush_staging
@@ -345,7 +451,8 @@ class TestFlushStagingBatch:
 
         await flush_staging(db, to_insert=rows, to_delete=["did:plc:a"])
 
-        dedup_sql = db.db.command.call_args_list[0][0][0]
+        # Index 0 is the initial TRUNCATE cleanup; dedup is at index 1
+        dedup_sql = db.db.command.call_args_list[1][0][0]
         assert "INSERT INTO commit" in dedup_sql
         assert "FROM staging" in dedup_sql
         assert "JOIN" in dedup_sql
@@ -358,7 +465,7 @@ class TestFlushStagingBatch:
 
         await flush_staging(db, to_insert=rows, to_delete=["did:plc:a"])
 
-        deletion_sql = db.db.command.call_args_list[1][0][0]
+        deletion_sql = db.db.command.call_args_list[2][0][0]
         assert "INSERT INTO commit" in deletion_sql
         assert "'null'" in deletion_sql
         assert "LEFT JOIN staging" in deletion_sql
@@ -373,7 +480,7 @@ class TestFlushStagingBatch:
 
         await flush_staging(db, to_insert=rows, to_delete=dids)
 
-        delete_call = db.db.command.call_args_list[2]
+        delete_call = db.db.command.call_args_list[3]
         delete_sql = delete_call[0][0]
         assert "DELETE FROM gap" in delete_sql
         assert delete_call[0][1]["dids"] == dids
@@ -386,7 +493,7 @@ class TestFlushStagingBatch:
 
         await flush_staging(db, to_insert=rows, to_delete=["did:plc:a"])
 
-        truncate_sql = db.db.command.call_args_list[3][0][0]
+        truncate_sql = db.db.command.call_args_list[4][0][0]
         assert "TRUNCATE TABLE staging" in truncate_sql
 
     async def test_no_insert_when_to_insert_empty_but_to_delete_nonempty(self):
@@ -398,8 +505,8 @@ class TestFlushStagingBatch:
         await flush_staging(db, to_insert=[], to_delete=dids)
 
         db.db.insert.assert_not_awaited()
-        # Should still run dedup, deletion, delete gap, truncate
-        assert db.db.command.await_count == 4
+        # truncate(cleanup), dedup, deletion, delete gap, truncate(final)
+        assert db.db.command.await_count == 5
 
 
 def _make_pds_config(max_pds_concurrency=10):
@@ -429,7 +536,7 @@ class TestPdsWorkerDownloadsAll:
             "did:plc:c": _ok_result("c"),
         }
 
-        async def fake_download(did, resolver, http_clients, cfg):
+        async def fake_download(did, resolver, http_clients, cfg, pds_host=None):
             return results[did]
 
         with patch("goeoview.gap_filler.download_one", side_effect=fake_download):
@@ -458,7 +565,7 @@ class TestPdsWorkerConcurrencyIncrease:
 
         call_order = []
 
-        async def fake_download(did, resolver, http_clients, cfg):
+        async def fake_download(did, resolver, http_clients, cfg, pds_host=None):
             call_order.append(did)
             user = _make_user(did=did)
             headers = {"ratelimit-remaining": "90", "ratelimit-limit": "100"}
@@ -481,7 +588,7 @@ class TestPdsWorkerConcurrencyDecrease:
         queue = asyncio.Queue()
         config = _make_pds_config(max_pds_concurrency=10)
 
-        async def fake_download(did, resolver, http_clients, cfg):
+        async def fake_download(did, resolver, http_clients, cfg, pds_host=None):
             user = _make_user(did=did)
             # < 10% remaining
             headers = {"ratelimit-remaining": "5", "ratelimit-limit": "100"}
@@ -509,7 +616,7 @@ class TestPdsWorkerRateLimit:
 
         call_count = 0
 
-        async def fake_download(did, resolver, http_clients, cfg):
+        async def fake_download(did, resolver, http_clients, cfg, pds_host=None):
             nonlocal call_count
             call_count += 1
             if did == "did:plc:a":
@@ -540,14 +647,15 @@ class TestPdsWorkerNon429Error:
         queue = asyncio.Queue()
         config = _make_pds_config(max_pds_concurrency=10)
 
-        async def fake_download(did, resolver, http_clients, cfg):
+        async def fake_download(did, resolver, http_clients, cfg, pds_host=None):
             if did == "did:plc:fail":
                 user = _make_user(did=did)
                 raise RepoDownloadException(user, status_code=500)
             user = _make_user(did=did)
             return user, b"car-data", {"ratelimit-remaining": "50", "ratelimit-limit": "100"}
 
-        with patch("goeoview.gap_filler.download_one", side_effect=fake_download):
+        with patch("goeoview.gap_filler.download_one", side_effect=fake_download), \
+             patch("goeoview.gap_filler.asyncio.sleep", new_callable=AsyncMock):
             await asyncio.wait_for(
                 pds_worker("pds.example.com", dids, queue, MagicMock(), MagicMock(), config),
                 timeout=5,
@@ -559,6 +667,181 @@ class TestPdsWorkerNon429Error:
         assert len(collected) == 1
         assert collected[0][0].did == "did:plc:ok"
 
+    async def test_unexpected_task_error_is_logged_and_worker_continues(self):
+        from goeoview.gap_filler import pds_worker
+
+        dids = ["did:plc:boom", "did:plc:ok"]
+        queue = asyncio.Queue()
+        config = _make_pds_config(max_pds_concurrency=10)
+
+        async def fake_download(did, resolver, http_clients, cfg, pds_host=None):
+            if did == "did:plc:boom":
+                raise RuntimeError("db exploded")
+            user = _make_user(did=did)
+            return user, b"car-data", {"ratelimit-remaining": "50", "ratelimit-limit": "100"}
+
+        with patch("goeoview.gap_filler.download_one", side_effect=fake_download), \
+             patch("goeoview.gap_filler.logger.exception") as mock_log_exception:
+            await asyncio.wait_for(
+                pds_worker("pds.example.com", dids, queue, MagicMock(), MagicMock(), config),
+                timeout=5,
+            )
+
+        user, car = queue.get_nowait()
+        assert user.did == "did:plc:ok"
+        assert car == b"car-data"
+        mock_log_exception.assert_called_once()
+
+
+class TestPdsWorkerNon5xxError:
+    async def test_connection_failure_does_not_increment_5xx_counter(self):
+        from goeoview.gap_filler import pds_worker
+
+        # 9 connection failures then 1 server error — should NOT trip circuit breaker
+        # because only 5xx errors count toward the threshold
+        dids = [f"did:plc:{i}" for i in range(11)]
+        queue = asyncio.Queue()
+        config = _make_pds_config(max_pds_concurrency=10)
+
+        download_count = 0
+
+        async def mixed_errors(did, resolver, http_clients, cfg, pds_host=None):
+            nonlocal download_count
+            download_count += 1
+            user = _make_user(did=did)
+            if download_count <= 9:
+                # Connection failures (status_code=None)
+                raise RepoDownloadException(user)
+            # 5xx error
+            raise RepoDownloadException(user, status_code=503)
+
+        with patch("goeoview.gap_filler.download_one", side_effect=mixed_errors), \
+             patch("goeoview.gap_filler.asyncio.sleep", new_callable=AsyncMock):
+            await asyncio.wait_for(
+                pds_worker("pds.example.com", dids, queue, MagicMock(), MagicMock(), config),
+                timeout=5,
+            )
+
+        # All 11 should have been attempted — circuit breaker should not trip
+        # (only 2 consecutive 5xx, far below threshold of 10)
+        assert download_count == 11
+
+
+class TestPdsWorker5xxBackoff:
+    async def test_sleeps_with_exponential_backoff_on_consecutive_5xx(self):
+        from goeoview.gap_filler import pds_worker
+
+        dids = [f"did:plc:{i}" for i in range(4)]
+        queue = asyncio.Queue()
+        config = _make_pds_config(max_pds_concurrency=10)
+
+        async def always_503(did, resolver, http_clients, cfg, pds_host=None):
+            user = _make_user(did=did)
+            raise RepoDownloadException(user, status_code=503)
+
+        sleep_calls = []
+
+        async def tracking_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        with patch("goeoview.gap_filler.download_one", side_effect=always_503), \
+             patch("goeoview.gap_filler.asyncio.sleep", side_effect=tracking_sleep):
+            await asyncio.wait_for(
+                pds_worker("pds.example.com", dids, queue, MagicMock(), MagicMock(), config),
+                timeout=5,
+            )
+
+        # Should have slept with increasing delays: 2^1, 2^2, 2^3, 2^4
+        assert len(sleep_calls) == 4
+        for i, delay in enumerate(sleep_calls):
+            assert delay == min(2 ** (i + 1), 60)
+
+    async def test_backoff_resets_on_success(self):
+        from goeoview.gap_filler import pds_worker
+
+        # fail, fail, succeed, fail — the last fail should backoff as if it's the 1st
+        dids = ["did:plc:f1", "did:plc:f2", "did:plc:ok", "did:plc:f3"]
+        queue = asyncio.Queue()
+        config = _make_pds_config(max_pds_concurrency=10)
+
+        async def selective_download(did, resolver, http_clients, cfg, pds_host=None):
+            user = _make_user(did=did)
+            if did == "did:plc:ok":
+                return user, b"car-data", {"ratelimit-remaining": "50", "ratelimit-limit": "100"}
+            raise RepoDownloadException(user, status_code=503)
+
+        sleep_calls = []
+
+        async def tracking_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        with patch("goeoview.gap_filler.download_one", side_effect=selective_download), \
+             patch("goeoview.gap_filler.asyncio.sleep", side_effect=tracking_sleep):
+            await asyncio.wait_for(
+                pds_worker("pds.example.com", dids, queue, MagicMock(), MagicMock(), config),
+                timeout=5,
+            )
+
+        # f1: backoff 2^1=2, f2: backoff 2^2=4, ok: resets, f3: backoff 2^1=2
+        assert sleep_calls == [2, 4, 2]
+
+
+class TestPdsWorkerCircuitBreaker:
+    async def test_bails_after_10_consecutive_5xx(self):
+        from goeoview.gap_filler import pds_worker
+
+        dids = [f"did:plc:{i}" for i in range(20)]
+        queue = asyncio.Queue()
+        config = _make_pds_config(max_pds_concurrency=10)
+
+        download_count = 0
+
+        async def always_503(did, resolver, http_clients, cfg, pds_host=None):
+            nonlocal download_count
+            download_count += 1
+            user = _make_user(did=did)
+            raise RepoDownloadException(user, status_code=503)
+
+        with patch("goeoview.gap_filler.download_one", side_effect=always_503), \
+             patch("goeoview.gap_filler.asyncio.sleep", new_callable=AsyncMock):
+            await asyncio.wait_for(
+                pds_worker("pds.example.com", dids, queue, MagicMock(), MagicMock(), config),
+                timeout=5,
+            )
+
+        # Should have stopped after 10 consecutive failures, not processed all 20
+        assert download_count == 10
+
+    async def test_circuit_breaker_resets_on_success(self):
+        from goeoview.gap_filler import pds_worker
+
+        # 9 failures, 1 success, 9 failures, 1 success — should never trip
+        pattern = ["fail"] * 9 + ["ok"] + ["fail"] * 9 + ["ok"]
+        dids = [f"did:plc:{i}" for i in range(len(pattern))]
+        queue = asyncio.Queue()
+        config = _make_pds_config(max_pds_concurrency=10)
+
+        call_index = 0
+
+        async def patterned_download(did, resolver, http_clients, cfg, pds_host=None):
+            nonlocal call_index
+            idx = call_index
+            call_index += 1
+            user = _make_user(did=did)
+            if pattern[idx] == "fail":
+                raise RepoDownloadException(user, status_code=503)
+            return user, b"car-data", {"ratelimit-remaining": "50", "ratelimit-limit": "100"}
+
+        with patch("goeoview.gap_filler.download_one", side_effect=patterned_download), \
+             patch("goeoview.gap_filler.asyncio.sleep", new_callable=AsyncMock):
+            await asyncio.wait_for(
+                pds_worker("pds.example.com", dids, queue, MagicMock(), MagicMock(), config),
+                timeout=10,
+            )
+
+        # All 20 DIDs should have been attempted (circuit never tripped)
+        assert call_index == 20
+
 
 class TestPdsWorkerBackpressure:
     async def test_blocks_on_full_queue(self):
@@ -568,7 +851,7 @@ class TestPdsWorkerBackpressure:
         queue = asyncio.Queue(maxsize=1)
         config = _make_pds_config(max_pds_concurrency=10)
 
-        async def fake_download(did, resolver, http_clients, cfg):
+        async def fake_download(did, resolver, http_clients, cfg, pds_host=None):
             user = _make_user(did=did)
             return user, b"car-data", {"ratelimit-remaining": "50", "ratelimit-limit": "100"}
 
@@ -635,8 +918,9 @@ class TestConsumeReposDIDThreshold:
         async def capturing_flush(db, to_insert, to_delete):
             flush_snapshots.append((list(to_insert), list(to_delete)))
 
-        # Queue 1002 items: 1001 triggers threshold flush, 1 remains for sentinel flush
-        for i in range(1002):
+        # Queue 15000 items — well over 2x the 5000 DID threshold to guarantee
+        # at least one mid-stream flush even with concurrent batched collection
+        for i in range(15000):
             user = _make_user(did=f"did:plc:{i}")
             queue.put_nowait((user, b"car-data"))
         queue.put_nowait(None)  # sentinel
@@ -645,12 +929,15 @@ class TestConsumeReposDIDThreshold:
              patch("goeoview.gap_filler.parse_repo", _fake_parse_repo), \
              patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
              patch("goeoview.gap_filler.DB", return_value=mock_db):
-            await asyncio.wait_for(consume_repos(queue, config), timeout=10)
+            await asyncio.wait_for(consume_repos(queue, config), timeout=30)
 
-        # Should have flushed twice: once at DID threshold, once at sentinel
-        assert len(flush_snapshots) == 2
-        # First flush should have had >1000 DIDs
-        assert len(flush_snapshots[0][1]) > 1000
+        # At least 2 flushes: one or more at DID threshold, plus sentinel
+        assert len(flush_snapshots) >= 2
+        # All 15000 DIDs should be accounted for across all flushes
+        all_dids = set()
+        for _, to_delete in flush_snapshots:
+            all_dids.update(to_delete)
+        assert len(all_dids) == 15000
 
 
 class TestConsumeReposTimeThreshold:
@@ -787,8 +1074,8 @@ class TestConsumeReposSerializedFlushes:
             await asyncio.sleep(0.05)  # simulate some work
             concurrent_flushes -= 1
 
-        # Queue enough items for multiple flushes (>1000 DIDs each)
-        for i in range(2002):
+        # Queue enough items for multiple flushes (>5000 DIDs each)
+        for i in range(10002):
             user = _make_user(did=f"did:plc:{i}")
             queue.put_nowait((user, b"car-data"))
         queue.put_nowait(None)
@@ -801,6 +1088,156 @@ class TestConsumeReposSerializedFlushes:
 
         # Only one flush should run at a time
         assert max_concurrent == 1
+
+
+class TestConsumeReposAsyncFlush:
+    async def test_consumer_continues_parsing_during_flush(self):
+        from goeoview.gap_filler import consume_repos
+
+        queue = asyncio.Queue()
+        config = _make_consume_config()
+        mock_db = _make_mock_db()
+
+        flush_events = []  # (event, timestamp)
+        parse_events = []  # (did, timestamp)
+
+        async def slow_flush(db, to_insert, to_delete):
+            flush_events.append(("start", time.monotonic()))
+            await asyncio.sleep(0.2)
+            flush_events.append(("end", time.monotonic()))
+
+        def tracking_parse(user, car):
+            parse_events.append((user.did, time.monotonic()))
+            return user.did, [
+                (user.did, "app.bsky.feed.post", "abc", 1, '{"text":"hi"}')
+            ]
+
+        # Queue enough to trigger flush (>5000), then more items, then sentinel
+        for i in range(5002):
+            user = _make_user(did=f"did:plc:{i}")
+            queue.put_nowait((user, b"car-data"))
+
+        # These should be parsed while the flush is running
+        for i in range(100):
+            user = _make_user(did=f"did:plc:after_{i}")
+            queue.put_nowait((user, b"car-data"))
+        queue.put_nowait(None)
+
+        with patch("goeoview.gap_filler.flush_staging", slow_flush), \
+             patch("goeoview.gap_filler.parse_repo", tracking_parse), \
+             patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
+             patch("goeoview.gap_filler.DB", return_value=mock_db):
+            await asyncio.wait_for(consume_repos(queue, config), timeout=30)
+
+        # The first flush should have started
+        assert len(flush_events) >= 2
+        flush_start = flush_events[0][1]
+        flush_end = flush_events[1][1]
+
+        # Some "after_" items should have been parsed during the flush window
+        parsed_during_flush = [
+            did for did, t in parse_events
+            if did.startswith("did:plc:after_") and flush_start < t < flush_end
+        ]
+        assert len(parsed_during_flush) > 0, \
+            "expected items to be parsed while flush was running"
+
+    async def test_sentinel_waits_for_pending_flush(self):
+        from goeoview.gap_filler import consume_repos
+
+        queue = asyncio.Queue()
+        config = _make_consume_config()
+        mock_db = _make_mock_db()
+
+        flush_completed = False
+
+        async def slow_flush(db, to_insert, to_delete):
+            nonlocal flush_completed
+            await asyncio.sleep(0.1)
+            flush_completed = True
+
+        # Queue enough to trigger one flush, then sentinel immediately
+        for i in range(5002):
+            user = _make_user(did=f"did:plc:{i}")
+            queue.put_nowait((user, b"car-data"))
+        queue.put_nowait(None)
+
+        with patch("goeoview.gap_filler.flush_staging", slow_flush), \
+             patch("goeoview.gap_filler.parse_repo", _fake_parse_repo), \
+             patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
+             patch("goeoview.gap_filler.DB", return_value=mock_db):
+            await asyncio.wait_for(consume_repos(queue, config), timeout=30)
+
+        # The background flush must have completed before consume_repos returned
+        assert flush_completed
+
+
+class TestConsumeReposConcurrentParsing:
+    async def test_parses_multiple_repos_concurrently(self):
+        from goeoview.gap_filler import consume_repos
+
+        queue = asyncio.Queue()
+        config = _make_consume_config(gap_parse_workers=4)
+        mock_db = _make_mock_db()
+
+        concurrent_parses = 0
+        max_concurrent = 0
+        lock = threading.Lock()
+
+        def slow_parse(user, car):
+            nonlocal concurrent_parses, max_concurrent
+            with lock:
+                concurrent_parses += 1
+                max_concurrent = max(max_concurrent, concurrent_parses)
+            time.sleep(0.05)  # simulate work
+            with lock:
+                concurrent_parses -= 1
+            return user.did, [
+                (user.did, "app.bsky.feed.post", "abc", 1, '{"text":"hi"}')
+            ]
+
+        for i in range(20):
+            user = _make_user(did=f"did:plc:{i}")
+            queue.put_nowait((user, b"car-data"))
+        queue.put_nowait(None)
+
+        with patch("goeoview.gap_filler.flush_staging", AsyncMock()), \
+             patch("goeoview.gap_filler.parse_repo", slow_parse), \
+             patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
+             patch("goeoview.gap_filler.DB", return_value=mock_db):
+            await asyncio.wait_for(consume_repos(queue, config), timeout=30)
+
+        # Multiple parses should have run concurrently
+        assert max_concurrent > 1
+
+    async def test_all_results_collected_with_concurrent_parsing(self):
+        from goeoview.gap_filler import consume_repos
+
+        queue = asyncio.Queue()
+        config = _make_consume_config(gap_parse_workers=4)
+        mock_db = _make_mock_db()
+
+        flush_snapshots = []
+
+        async def capturing_flush(db, to_insert, to_delete):
+            flush_snapshots.append((list(to_insert), list(to_delete)))
+
+        for i in range(50):
+            user = _make_user(did=f"did:plc:{i}")
+            queue.put_nowait((user, b"car-data"))
+        queue.put_nowait(None)
+
+        with patch("goeoview.gap_filler.flush_staging", capturing_flush), \
+             patch("goeoview.gap_filler.parse_repo", _fake_parse_repo), \
+             patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
+             patch("goeoview.gap_filler.DB", return_value=mock_db):
+            await asyncio.wait_for(consume_repos(queue, config), timeout=30)
+
+        # All 50 DIDs should appear across all flushes
+        all_dids = set()
+        for to_insert, to_delete in flush_snapshots:
+            all_dids.update(to_delete)
+        assert len(all_dids) == 50
 
 
 def _make_gap_config(gap_queue_size=100, gap_max_pds_concurrency=10,
@@ -970,3 +1407,178 @@ class TestCoordinateGapsResolutionFailure:
         assert mock_pw.await_count == 1
         assert mock_pw.call_args.args[0] == "https://pds.example.com"
         assert mock_pw.call_args.args[1] == ["did:plc:ok"]
+
+
+class TestConsumeReposFlushFailureRecovery:
+    async def test_continues_after_background_flush_raises(self):
+        """When a background flush fails, the consumer should log the error
+        and continue processing rather than crashing and deadlocking."""
+        from goeoview.gap_filler import consume_repos
+
+        queue = asyncio.Queue()
+        config = _make_consume_config()
+        mock_db = _make_mock_db()
+
+        flush_call_count = 0
+
+        async def failing_then_ok_flush(db, to_insert, to_delete):
+            nonlocal flush_call_count
+            flush_call_count += 1
+            if flush_call_count == 1:
+                raise RuntimeError("Queue is shutdown")
+            # Subsequent flushes succeed
+
+        # Queue enough to trigger two flushes (>5000 DIDs each), then sentinel
+        for i in range(10002):
+            user = _make_user(did=f"did:plc:{i}")
+            queue.put_nowait((user, b"car-data"))
+        queue.put_nowait(None)
+
+        with patch("goeoview.gap_filler.flush_staging", failing_then_ok_flush), \
+             patch("goeoview.gap_filler.parse_repo", _fake_parse_repo), \
+             patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
+             patch("goeoview.gap_filler.DB", return_value=mock_db):
+            # Must not raise or hang — should complete gracefully
+            await asyncio.wait_for(consume_repos(queue, config), timeout=30)
+
+        # Should have attempted multiple flushes despite the first failing
+        assert flush_call_count >= 2
+
+    async def test_flush_failure_is_logged(self):
+        """The original exception from a failed flush should be logged."""
+        from goeoview.gap_filler import consume_repos
+
+        queue = asyncio.Queue()
+        config = _make_consume_config()
+        mock_db = _make_mock_db()
+
+        flush_count = 0
+
+        async def fail_once_flush(db, to_insert, to_delete):
+            nonlocal flush_count
+            flush_count += 1
+            if flush_count == 1:
+                raise RuntimeError("Queue is shutdown")
+
+        for i in range(10002):
+            user = _make_user(did=f"did:plc:{i}")
+            queue.put_nowait((user, b"car-data"))
+        queue.put_nowait(None)
+
+        with patch("goeoview.gap_filler.flush_staging", fail_once_flush), \
+             patch("goeoview.gap_filler.parse_repo", _fake_parse_repo), \
+             patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
+             patch("goeoview.gap_filler.DB", return_value=mock_db), \
+             patch("goeoview.gap_filler.logger") as mock_logger:
+            await asyncio.wait_for(consume_repos(queue, config), timeout=30)
+
+        # The error should have been logged via logger.exception
+        exception_calls = [c for c in mock_logger.method_calls
+                           if c[0] == "exception"]
+        assert any("flush failed" in str(c) for c in exception_calls), \
+            f"Expected flush failure to be logged, got: {exception_calls}"
+
+    async def test_sentinel_flush_failure_does_not_crash(self):
+        """If the final flush on sentinel also fails, consume_repos
+        should still exit gracefully."""
+        from goeoview.gap_filler import consume_repos
+
+        queue = asyncio.Queue()
+        config = _make_consume_config()
+        mock_db = _make_mock_db()
+
+        async def always_fail_flush(db, to_insert, to_delete):
+            raise RuntimeError("ClickHouse gone")
+
+        for i in range(3):
+            user = _make_user(did=f"did:plc:{i}")
+            queue.put_nowait((user, b"car-data"))
+        queue.put_nowait(None)
+
+        with patch("goeoview.gap_filler.flush_staging", always_fail_flush), \
+             patch("goeoview.gap_filler.parse_repo", _fake_parse_repo), \
+             patch("goeoview.gap_filler.ProcessPoolExecutor", ThreadPoolExecutor), \
+             patch("goeoview.gap_filler.DB", return_value=mock_db):
+            # Should not raise — exits gracefully
+            await asyncio.wait_for(consume_repos(queue, config), timeout=10)
+
+
+class TestFlushStagingTruncatesFirst:
+    async def test_staging_truncated_before_insert(self):
+        """Staging table should be truncated at the start of flush
+        to clean up any partial data from a previously failed flush."""
+        from goeoview.gap_filler import flush_staging
+
+        db = _make_mock_db()
+        call_order = []
+
+        async def tracking_insert(*args, **kwargs):
+            call_order.append(("insert", args[0] if args else None))
+
+        async def tracking_command(sql, *args, **kwargs):
+            if "TRUNCATE" in sql:
+                call_order.append(("truncate",))
+            elif "INSERT INTO commit" in sql:
+                call_order.append(("dedup_insert",))
+            elif "DELETE" in sql:
+                call_order.append(("delete",))
+
+        db.db.insert = tracking_insert
+        db.db.command = tracking_command
+
+        to_insert = [("did:plc:a", "col", "key", 1, '{"v":1}')]
+        to_delete = ["did:plc:a"]
+        await flush_staging(db, to_insert, to_delete)
+
+        # First operation should be truncate
+        assert call_order[0] == ("truncate",), \
+            f"Expected truncate first, got: {call_order}"
+
+
+class TestGapsLoopConsumerRestart:
+    async def test_restarts_consumer_if_it_dies(self):
+        """If the consumer task dies unexpectedly, gaps_loop should
+        detect it and restart rather than deadlocking."""
+        from goeoview.gap_filler import gaps_loop
+
+        mock_db = _make_mock_db()
+        mock_db.db.query = AsyncMock(return_value=_make_empty_gap_query_result())
+
+        iteration = 0
+
+        async def fake_consume(queue, config):
+            nonlocal iteration
+            iteration += 1
+            if iteration == 1:
+                raise RuntimeError("unexpected consumer death")
+            # Second invocation: run until sentinel
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+
+        config = MagicMock()
+        config.gap_queue_size = 10
+        config.http_connect_timeout = 5
+        config.http_read_timeout = 30
+
+        call_count = 0
+
+        async def counting_coordinate(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                raise KeyboardInterrupt("stop the loop")
+
+        with patch("goeoview.gap_filler.DB", return_value=mock_db), \
+             patch("goeoview.gap_filler.consume_repos", fake_consume), \
+             patch("goeoview.gap_filler.coordinate_gaps", counting_coordinate):
+            try:
+                await asyncio.wait_for(gaps_loop(
+                    MagicMock(), MagicMock(), config
+                ), timeout=10)
+            except (KeyboardInterrupt, asyncio.TimeoutError):
+                pass
+
+        # Consumer should have been started twice (original + restart)
+        assert iteration >= 2

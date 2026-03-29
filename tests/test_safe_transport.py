@@ -1,7 +1,8 @@
 import pytest
 import socket
+import time
 from unittest.mock import patch, MagicMock
-from goeoview.safe_transport import validate_url_host
+from goeoview.safe_transport import async_validate_url_host, validate_url_host
 
 
 def _mock_getaddrinfo(ip):
@@ -106,3 +107,13 @@ def test_rejects_mixed_public_and_private():
     with patch("goeoview.safe_transport.socket.getaddrinfo", fake):
         with pytest.raises(ValueError, match="non-public"):
             validate_url_host("http://evil.com/foo")
+
+
+@pytest.mark.asyncio
+async def test_async_validate_url_host_times_out():
+    def slow_validate(url):
+        time.sleep(0.05)
+
+    with patch("goeoview.safe_transport.validate_url_host", side_effect=slow_validate):
+        with pytest.raises(ValueError, match="DNS validation timed out"):
+            await async_validate_url_host("https://slow.example.com", timeout=0.01)

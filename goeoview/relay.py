@@ -57,7 +57,8 @@ packet_types = [
 ]
 packet_types = {cbrrr.encode_dag_cbor(x): y for x, y in packet_types}
 
-async def insert_commits(db: DB, memory: deque, firehose_url, last_seq):
+async def insert_commits(db: DB, memory: deque, firehose_url, last_seq,
+                         user_map=None):
     dids = [x[0] for x in memory]
     ret = await db.db.query(
         "select did, max(rev) from commit where did in {dids:Array(String)} group by did",
@@ -95,10 +96,12 @@ async def insert_commits(db: DB, memory: deque, firehose_url, last_seq):
             "value": value,
             "since": since,
             "action": action,
+            "user": user_map.get(did) if user_map else None,
         })
 
     await db.db.insert("gap", gaps)
-    await db.db.insert("commit", commits)
+    await db.db.insert("commit", commits,
+                       column_names=["did", "collection", "key", "rev", "value"])
     await db.db.insert("cursor", [(firehose_url, last_seq)])
 
     memory.clear()
@@ -151,7 +154,7 @@ async def _try_historical_key(message, repo, commit_time):
     return validate_commit(message, historical_key)
 
 
-async def _handle_commit_serial(message, did_resolver, quarantine):
+async def _handle_commit_serial(message, did_resolver, quarantine, user_map=None):
     """Signature-retry path: resolve DID with increasing retries and validate."""
     decoded = cbrrr.decode_dag_cbor(message)
     repo = decoded["repo"]
@@ -159,6 +162,8 @@ async def _handle_commit_serial(message, did_resolver, quarantine):
     commit_time = decoded["time"]
 
     user = await did_resolver.resolve(repo)
+    if user_map is not None and user is not None:
+        user_map[repo] = user
     if user.atproto_key is None:
         logger.warning("no key for %s", user.did)
         await quarantine.save(repo, seq, message,
@@ -222,7 +227,7 @@ async def _handle_commit_serial(message, did_resolver, quarantine):
                               extra={"retries": retries})
         return []
 
-async def _process_batch(batch, memory, did_resolver, config, loop, pool, _validate_commit, quarantine):
+async def _process_batch(batch, memory, did_resolver, config, loop, pool, _validate_commit, quarantine, user_map=None):
     """Process a batch of commits: resolve DIDs, validate in parallel, collect rows.
 
     batch: list of (message_bytes, seq, repo, recvtime) tuples.
@@ -243,6 +248,8 @@ async def _process_batch(batch, memory, did_resolver, config, loop, pool, _valid
             logger.warning("DID resolve failed for %s: %s", repo, user)
             action.append("resolve_failed")
             continue
+        if user_map is not None:
+            user_map[user.did] = user
         if user.pds is not None and _is_pds_blocked(user.pds, config.blocked_pds):
             action.append("skip")
             continue
@@ -268,7 +275,7 @@ async def _process_batch(batch, memory, did_resolver, config, loop, pool, _valid
             continue
 
         if action[i] == "resolve_failed":
-            rows = await _handle_commit_serial(message_bytes, did_resolver, quarantine)
+            rows = await _handle_commit_serial(message_bytes, did_resolver, quarantine, user_map=user_map)
             memory.extend(rows)
             continue
 
@@ -278,7 +285,7 @@ async def _process_batch(batch, memory, did_resolver, config, loop, pool, _valid
         elif result.get("fatal"):
             raise CommitValidationError(result["error"])
         elif result.get("retry"):
-            rows = await _handle_commit_serial(message_bytes, did_resolver, quarantine)
+            rows = await _handle_commit_serial(message_bytes, did_resolver, quarantine, user_map=user_map)
             memory.extend(rows)
         else:
             logger.warning("commit error for %s seq=%s: %s", repo, seq, result.get("error"))
@@ -290,6 +297,7 @@ async def _process_batch(batch, memory, did_resolver, config, loop, pool, _valid
 async def firehose(firehose_url, did_resolver, config, quarantine, pool, registry):
     db = DB()
     memory = deque()
+    user_map = {}
 
     res = await db.db.query("SELECT val FROM cursor WHERE url = {url:String} ORDER BY val DESC LIMIT 1", {"url": firehose_url})
 
@@ -319,11 +327,11 @@ async def firehose(firehose_url, did_resolver, config, quarantine, pool, registr
                     )
                 except asyncio.TimeoutError:
                     if batch:
-                        await _process_batch(batch, memory, did_resolver, config, loop, pool, validate_commit, quarantine)
+                        await _process_batch(batch, memory, did_resolver, config, loop, pool, validate_commit, quarantine, user_map=user_map)
                         last_safe_seq = last_seen_seq
                         batch.clear()
                         if len(memory) >= config.firehose_insert_every:
-                            hook_rows = await insert_commits(db, memory, firehose_url, last_safe_seq)
+                            hook_rows = await insert_commits(db, memory, firehose_url, last_safe_seq, user_map=user_map)
                             registry.dispatch(hook_rows)
                     continue
                 recvtime = datetime.now(UTC)
@@ -389,23 +397,23 @@ async def firehose(firehose_url, did_resolver, config, quarantine, pool, registr
                 batch.append((message, header["seq"], header["repo"], recvtime))
 
                 if len(batch) >= config.firehose_batch_size:
-                    await _process_batch(batch, memory, did_resolver, config, loop, pool, validate_commit, quarantine)
+                    await _process_batch(batch, memory, did_resolver, config, loop, pool, validate_commit, quarantine, user_map=user_map)
                     last_safe_seq = last_seen_seq
                     batch.clear()
 
                     if len(memory) >= config.firehose_insert_every:
-                        hook_rows = await insert_commits(db, memory, firehose_url, last_safe_seq)
+                        hook_rows = await insert_commits(db, memory, firehose_url, last_safe_seq, user_map=user_map)
                         registry.dispatch(hook_rows)
     finally:
         try:
             if batch:
-                await _process_batch(batch, memory, did_resolver, config, loop, pool, validate_commit, quarantine)
+                await _process_batch(batch, memory, did_resolver, config, loop, pool, validate_commit, quarantine, user_map=user_map)
                 last_safe_seq = last_seen_seq
                 batch.clear()
         except Exception:
             pass  # best-effort flush; don't mask the original exception
         if memory:
-            hook_rows = await insert_commits(db, memory, firehose_url, last_safe_seq)
+            hook_rows = await insert_commits(db, memory, firehose_url, last_safe_seq, user_map=user_map)
             registry.dispatch(hook_rows)
         await ws_client.aclose()
 
@@ -487,11 +495,26 @@ def parse_repo(user, car):
     return user.did, to_insert
 
 class RepoDownloadException(Exception):
-    def __init__(self, user, status_code=None, headers=None):
+    def __init__(self, user, status_code=None, headers=None, *, cause=None, stage=None):
         self.user = user
         self.status_code = status_code
         self.headers = headers or {}
-        super().__init__(user, status_code)
+        self.cause = cause
+        self.stage = stage
+        super().__init__(self.describe())
 
+    def describe(self):
+        parts = [f"did={self.user.did}"]
+        if getattr(self.user, "pds", None):
+            parts.append(f"pds={self.user.pds}")
+        if self.status_code is not None:
+            parts.append(f"status={self.status_code}")
+        if self.stage:
+            parts.append(f"stage={self.stage}")
+        if self.cause is not None:
+            parts.append(
+                f"cause={type(self.cause).__name__}: {self.cause}"
+            )
+        return " ".join(parts)
 
 

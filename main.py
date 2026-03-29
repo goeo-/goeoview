@@ -48,7 +48,11 @@ async def main() -> int:
         print(f"PLC latest created_at: {stats['latest_created_at']}")
         return 0
 
-    http_clients = HTTPClientManager(config.http_connect_timeout, config.http_read_timeout)
+    http_clients = HTTPClientManager(
+        config.http_connect_timeout,
+        config.http_read_timeout,
+        config.http_dns_validation_timeout,
+    )
     did_resolver = DIDResolver(http_clients, plc_state_store)
 
     db = DB(args.db_host, args.db_name, args.db_port)

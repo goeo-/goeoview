@@ -5,10 +5,11 @@ from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, UTC
 from collections import defaultdict
 
-import httpx
+import aiohttp
 
 from .db import DB
 from .relay import parse_repo, RepoDownloadException
+from .safe_transport import SafeResolver
 from .logger import get_logger
 
 logger = get_logger("goeoview.gap_filler")
@@ -27,45 +28,60 @@ ENGINE = Memory
 """
 
 
-async def download_one(did, did_resolver, http_clients, config):
+async def download_one(did, did_resolver, session, config, pds_host=None):
     """Download a single repo. Returns (user, car_bytes, response_headers).
 
     Raises RepoDownloadException on any failure.
     """
     user = await did_resolver.resolve(did)
 
-    if user.pds is None or not user.pds.startswith("https://"):
-        raise RepoDownloadException(user)
+    repo_pds = pds_host or user.pds
+
+    if repo_pds is None or not repo_pds.startswith("https://"):
+        raise RepoDownloadException(user, stage="pds_validation")
+
+    url = f"{repo_pds}/xrpc/com.atproto.sync.getRepo?did={user.did}"
 
     db = DB()
     try:
-        async with http_clients.repo().stream(
-            "GET", f"{user.pds}/xrpc/com.atproto.sync.getRepo?did={user.did}"
-        ) as response:
+        async with session.get(url) as response:
             headers = dict(response.headers)
 
-            if response.status_code != 200:
-                await response.aread()
-                if response.status_code in (400, 401, 403):
-                    await db.db.insert("bad_did", [(user.did, response.status_code)])
-                raise RepoDownloadException(user, response.status_code, headers)
+            if response.status != 200:
+                await response.read()
+                if response.status in (400, 401, 403):
+                    await db.db.insert(
+                        "bad_did",
+                        [(user.did, response.status)],
+                        column_names=["did", "status_code"],
+                    )
+                raise RepoDownloadException(
+                    user,
+                    response.status,
+                    headers,
+                    stage="http_response",
+                )
 
             chunks = []
             total = 0
-            async for chunk in response.aiter_bytes():
+            async for chunk in response.content.iter_any():
                 total += len(chunk)
                 if total > config.max_repo_size:
-                    raise RepoDownloadException(user)
+                    raise RepoDownloadException(
+                        user,
+                        stage="stream_body",
+                        cause=ValueError(
+                            f"repo exceeded max size {config.max_repo_size} bytes"
+                        ),
+                    )
                 chunks.append(chunk)
             body = b"".join(chunks)
     except RepoDownloadException:
         raise
     except (
-        httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError, httpx.ReadTimeout,
-        httpx.InvalidURL, httpx.UnsupportedProtocol, httpx.RemoteProtocolError,
-        ssl.SSLError, ValueError
-    ):
-        raise RepoDownloadException(user)
+        aiohttp.ClientError, asyncio.TimeoutError, ssl.SSLError, OSError,
+    ) as e:
+        raise RepoDownloadException(user, stage="request", cause=e) from e
 
     return user, body, headers
 
@@ -76,7 +92,8 @@ def adjust_target(headers, current_target, max_target):
         remaining = int(headers.get("ratelimit-remaining", ""))
         limit = int(headers.get("ratelimit-limit", ""))
     except (ValueError, TypeError):
-        return current_target
+        # No rate limit headers — ramp up freely
+        return min(current_target + 1, max_target)
 
     if limit <= 0:
         return current_target
@@ -89,15 +106,21 @@ def adjust_target(headers, current_target, max_target):
     return current_target
 
 
-async def pds_worker(pds_host, dids, queue, did_resolver, http_clients, config):
+async def pds_worker(pds_host, dids, queue, did_resolver, session, config):
     """Download repos for a single PDS, respecting rate limits."""
     target = 1
     in_flight = set()
+    total_assigned = len(dids)
     dids = iter(dids)
+    consecutive_5xx = 0
+    max_consecutive_5xx = 10
+    completed = 0
+    failed = 0
 
     for did in itertools.islice(dids, target):
         in_flight.add(asyncio.create_task(
-            download_one(did, did_resolver, http_clients, config)
+            download_one(did, did_resolver, session, config, pds_host=pds_host),
+            name=f"download_one:{pds_host}:{did}",
         ))
 
     while in_flight:
@@ -109,7 +132,24 @@ async def pds_worker(pds_host, dids, queue, did_resolver, http_clients, config):
             try:
                 user, car, headers = await task
                 await queue.put((user, car))
+                old_target = target
                 target = adjust_target(headers, target, config.gap_max_pds_concurrency)
+                completed += 1
+                if target != old_target:
+                    logger.info(
+                        "PDS %s concurrency %d→%d (remaining=%s limit=%s)",
+                        pds_host, old_target, target,
+                        headers.get("ratelimit-remaining", "?"),
+                        headers.get("ratelimit-limit", "?"),
+                    )
+                elif completed % 100 == 0:
+                    logger.info(
+                        "PDS %s: %d done, target=%d, in_flight=%d (remaining=%s limit=%s)",
+                        pds_host, completed, target, len(in_flight),
+                        headers.get("ratelimit-remaining", "?"),
+                        headers.get("ratelimit-limit", "?"),
+                    )
+                consecutive_5xx = 0
             except RepoDownloadException as e:
                 if e.status_code == 429:
                     try:
@@ -121,7 +161,33 @@ async def pds_worker(pds_host, dids, queue, did_resolver, http_clients, config):
                         await asyncio.sleep(30)
                     target = 1
                 else:
-                    logger.warning("failed to download from %s: %s", pds_host, e.args)
+                    failed += 1
+                    logger.warning("failed to download from %s: %s", pds_host, e)
+                    if e.status_code and e.status_code >= 500:
+                        consecutive_5xx += 1
+                        if consecutive_5xx >= max_consecutive_5xx:
+                            logger.warning(
+                                "PDS %s: %d consecutive 5xx errors, skipping remaining DIDs",
+                                pds_host, consecutive_5xx,
+                            )
+                            for pending in in_flight:
+                                pending.cancel()
+                            for pending in in_flight:
+                                try:
+                                    await pending
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                            return
+                        backoff = min(2 ** consecutive_5xx, 60)
+                        await asyncio.sleep(backoff)
+                        target = 1
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "unexpected download task failure for %s task=%s",
+                    pds_host,
+                    task.get_name(),
+                )
 
         # Spawn up to target
         while len(in_flight) < target:
@@ -130,8 +196,14 @@ async def pds_worker(pds_host, dids, queue, did_resolver, http_clients, config):
             except StopIteration:
                 break
             in_flight.add(asyncio.create_task(
-                download_one(did, did_resolver, http_clients, config)
+                download_one(did, did_resolver, session, config, pds_host=pds_host),
+                name=f"download_one:{pds_host}:{did}",
             ))
+
+    logger.info(
+        "PDS %s finished: %d/%d downloaded, %d failed",
+        pds_host, completed, total_assigned, failed,
+    )
 
 
 async def flush_staging(db, to_insert, to_delete):
@@ -141,13 +213,16 @@ async def flush_staging(db, to_insert, to_delete):
 
     logger.info("flushing %d rows for %d DIDs", len(to_insert), len(to_delete))
 
+    # 0. Clean up any partial data from a previously failed flush
+    await db.db.command("TRUNCATE TABLE staging")
+
     # 1. Bulk insert into staging
     if to_insert:
         await db.db.insert("staging", to_insert)
 
     # 2. Dedup insert: changed and new records
     await db.db.command("""
-        INSERT INTO commit
+        INSERT INTO commit (did, collection, key, rev, value)
         SELECT s.did, s.collection, s.key, s.rev, s.value
         FROM staging AS s
         LEFT JOIN (
@@ -162,7 +237,7 @@ async def flush_staging(db, to_insert, to_delete):
 
     # 3. Deletion detection: records in commit but not in repo
     await db.db.command("""
-        INSERT INTO commit
+        INSERT INTO commit (did, collection, key, rev, value)
         SELECT cur.did, cur.collection, cur.key, head.rev, 'null'
         FROM (
             SELECT did, collection, key, argMax(value, rev) AS value
@@ -192,6 +267,24 @@ async def flush_staging(db, to_insert, to_delete):
     logger.info("flush complete")
 
 
+async def _wait_flush(flush_task):
+    """Await a pending flush task if one exists."""
+    if flush_task is not None:
+        await flush_task
+
+
+def _collect_parse_results(done_tasks, to_insert, to_delete):
+    """Collect results from completed parse tasks into buffers."""
+    for task in done_tasks:
+        try:
+            did, commits = task.result()
+            logger.info("parsed repo %s: %d records", did, len(commits))
+            to_insert.extend(commits)
+            to_delete.append(did)
+        except Exception as e:
+            logger.warning("failed to parse repo: %s", e)
+
+
 async def consume_repos(queue, config):
     """Pull repos from queue, parse in process pool, batch insert."""
     loop = asyncio.get_running_loop()
@@ -200,51 +293,119 @@ async def consume_repos(queue, config):
     to_insert = []
     to_delete = []
     last_flush = datetime.now(UTC)
+    flush_task = None
+    in_flight = set()
+
+    def _should_flush():
+        now = datetime.now(UTC)
+        return (
+            len(to_delete) > 5000
+            or len(to_insert) > 500000
+            or ((to_insert or to_delete) and (now - last_flush).total_seconds() > 10)
+        )
+
+    async def _do_flush():
+        nonlocal to_insert, to_delete, flush_task, last_flush
+        try:
+            await _wait_flush(flush_task)
+        except Exception:
+            # Previous flush failed — its batch is lost but those DIDs
+            # remain in the gap table and will retry next cycle.
+            logger.exception("background flush failed")
+        flush_task = asyncio.create_task(
+            flush_staging(db, to_insert, to_delete)
+        )
+        to_insert = []
+        to_delete = []
+        last_flush = datetime.now(UTC)
+
+    import time as _time
+
+    _t_loop = _t_harvest = _t_flush = _t_wait = _t_queue = _t_submit = 0.0
+    _n_loops = 0
 
     with ProcessPoolExecutor(config.gap_parse_workers) as pool:
         while True:
+            _loop_start = _time.monotonic()
+            _n_loops += 1
+
+            # Harvest completed parses without blocking
+            _t0 = _time.monotonic()
+            done = {t for t in in_flight if t.done()}
+            if done:
+                in_flight -= done
+                _collect_parse_results(done, to_insert, to_delete)
+            _t_harvest += _time.monotonic() - _t0
+
+            # Check flush thresholds
+            _t0 = _time.monotonic()
+            if _should_flush():
+                await _do_flush()
+            _t_flush += _time.monotonic() - _t0
+
+            # If at parse capacity, wait for one to finish
+            if len(in_flight) >= config.gap_parse_workers:
+                _t0 = _time.monotonic()
+                done, in_flight = await asyncio.wait(
+                    in_flight, return_when=asyncio.FIRST_COMPLETED
+                )
+                _t_wait += _time.monotonic() - _t0
+                _collect_parse_results(done, to_insert, to_delete)
+                if _n_loops % 100 == 0:
+                    logger.info(
+                        "consumer timing (%d loops): harvest=%.2fs flush=%.2fs wait=%.2fs queue=%.2fs submit=%.2fs in_flight=%d qsize=%d",
+                        _n_loops, _t_harvest, _t_flush, _t_wait, _t_queue, _t_submit,
+                        len(in_flight), queue.qsize(),
+                    )
+                    _t_harvest = _t_flush = _t_wait = _t_queue = _t_submit = 0.0
+                continue
+
+            # Pull from queue
+            _t0 = _time.monotonic()
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                now = datetime.now(UTC)
-                if (to_insert or to_delete) and (now - last_flush).total_seconds() > 10:
-                    await flush_staging(db, to_insert, to_delete)
-                    to_insert.clear()
-                    to_delete.clear()
-                    last_flush = now
+                _t_queue += _time.monotonic() - _t0
+                logger.info(
+                    "consumer queue timeout: in_flight=%d qsize=%d harvest=%.2fs flush=%.2fs wait=%.2fs queue=%.2fs",
+                    len(in_flight), queue.qsize(), _t_harvest, _t_flush, _t_wait, _t_queue,
+                )
+                _t_harvest = _t_flush = _t_wait = _t_queue = _t_submit = 0.0
+                # Wait for at least one parse if any are in flight
+                if in_flight:
+                    done, in_flight = await asyncio.wait(
+                        in_flight, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    _collect_parse_results(done, to_insert, to_delete)
                 continue
+            _t_queue += _time.monotonic() - _t0
 
             if item is None:
+                # Drain remaining parses
+                if in_flight:
+                    done, _ = await asyncio.wait(in_flight)
+                    _collect_parse_results(done, to_insert, to_delete)
+                try:
+                    await _wait_flush(flush_task)
+                except Exception:
+                    logger.exception("background flush failed during shutdown")
                 if to_insert or to_delete:
-                    await flush_staging(db, to_insert, to_delete)
+                    try:
+                        await flush_staging(db, to_insert, to_delete)
+                    except Exception:
+                        logger.exception("final flush failed during shutdown")
                 logger.info("consumer received shutdown sentinel")
                 return
 
+            _t0 = _time.monotonic()
             user, car = item
-
-            try:
-                did, commits = await loop.run_in_executor(
-                    pool, parse_repo, user, car
-                )
-                logger.info("parsed repo %s: %d records", did, len(commits))
-                to_insert.extend(commits)
-                to_delete.append(did)
-            except Exception as e:
-                logger.warning("failed to parse repo: %s", e)
-
-            now = datetime.now(UTC)
-            if (
-                len(to_delete) > 1000
-                or len(to_insert) > 100000
-                or ((to_insert or to_delete) and (now - last_flush).total_seconds() > 10)
-            ):
-                await flush_staging(db, to_insert, to_delete)
-                to_insert.clear()
-                to_delete.clear()
-                last_flush = now
+            in_flight.add(
+                loop.run_in_executor(pool, parse_repo, user, car)
+            )
+            _t_submit += _time.monotonic() - _t0
 
 
-async def coordinate_gaps(queue, did_resolver, http_clients, config,
+async def coordinate_gaps(queue, did_resolver, session, config,
                           plc_state_store=None):
     """Query gaps, resolve DIDs, group by PDS, spawn per-PDS workers."""
     db = DB()
@@ -303,7 +464,7 @@ async def coordinate_gaps(queue, did_resolver, http_clients, config,
     async def run_worker(pds_host, pds_dids):
         async with semaphore:
             return await pds_worker(pds_host, pds_dids, queue, did_resolver,
-                                    http_clients, config)
+                                    session, config)
 
     workers = [
         asyncio.create_task(
@@ -331,12 +492,31 @@ async def gaps_loop(did_resolver, http_clients, config, plc_state_store=None):
         consume_repos(queue, config), name="gap_consumer"
     )
 
-    try:
-        while True:
-            await coordinate_gaps(queue, did_resolver, http_clients, config,
-                                  plc_state_store)
-            await asyncio.sleep(1)
-    finally:
-        # Graceful shutdown
-        await queue.put(None)
-        await consumer_task
+    connector = aiohttp.TCPConnector(
+        limit=1000, limit_per_host=0, resolver=SafeResolver(),
+    )
+    timeout = aiohttp.ClientTimeout(
+        connect=config.http_connect_timeout,
+        sock_read=config.http_read_timeout,
+    )
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout
+    ) as session:
+        try:
+            while True:
+                if consumer_task.done():
+                    # Consumer died unexpectedly — log and restart it
+                    exc = consumer_task.exception() if not consumer_task.cancelled() else None
+                    logger.error("consumer task died, restarting: %s", exc)
+                    # Drain the old queue so stale items don't pile up
+                    queue = asyncio.Queue(maxsize=config.gap_queue_size)
+                    consumer_task = asyncio.create_task(
+                        consume_repos(queue, config), name="gap_consumer"
+                    )
+                await coordinate_gaps(queue, did_resolver, session, config,
+                                      plc_state_store)
+                await asyncio.sleep(1)
+        finally:
+            # Graceful shutdown
+            await queue.put(None)
+            await consumer_task

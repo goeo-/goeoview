@@ -6,9 +6,15 @@ from .safe_transport import SafeTransport
 
 
 class HTTPClientManager:
-    def __init__(self, connect_timeout: float = 5.0, read_timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        connect_timeout: float = 5.0,
+        read_timeout: float = 30.0,
+        dns_validation_timeout: float = 3.0,
+    ) -> None:
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
+        self._dns_validation_timeout = dns_validation_timeout
         self._clients: dict[str, httpx.AsyncClient] = {}
 
     def _timeout(self) -> httpx.Timeout:
@@ -21,8 +27,15 @@ class HTTPClientManager:
         )
 
     def _build_untrusted(self) -> httpx.AsyncClient:
+        limits = httpx.Limits(
+            max_connections=1000,
+            max_keepalive_connections=200,
+        )
         return httpx.AsyncClient(
-            transport=SafeTransport(),
+            transport=SafeTransport(
+                limits=limits,
+                validation_timeout=self._dns_validation_timeout,
+            ),
             timeout=self._timeout(),
             follow_redirects=False,
         )
